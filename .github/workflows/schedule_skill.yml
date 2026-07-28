@@ -26,19 +26,24 @@ jobs:
           # 如果你的指令碼有其他套件，可以在這裡安裝，例如：
           # pip install -r requirements.txt
 
-      - name: Run Script
-        # 換成 repo 內實際存在的指令碼，例如 scripts/main.py
-        run: python scripts/main.py
+      - name: Generate report
+        run: |
+          {
+            echo "# AI Skill Report"
+            echo
+            echo "Generated at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo '```json'
+            python scripts/crawl_news.py
+            echo '```'
+          } > skill_report.md
 
       - name: Send MD File to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # 換成 repo 內實際產生的 Markdown 檔案路徑
           FILE_PATH="skill_report.md"
-
-          # 讀取 MD 內容並透過 API 發送
           CAPTION="這是您定時生成的技能報告："
           curl -F chat_id="$TELEGRAM_CHAT_ID" \
                -F document=@"$FILE_PATH" \
