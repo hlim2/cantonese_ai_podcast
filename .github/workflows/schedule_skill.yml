@@ -2,15 +2,14 @@ name: Run Skill and Send to Telegram
 
 on:
   schedule:
-    # 這裡設定執行的時間（使用 UTC 時間，比香港/台灣慢 8 小時）
-    # 例如下面的設定代表每天早上 9:00 (UTC 1:00) 執行
+    # 每天早上 9:00 HKT = UTC 01:00
     - cron: '0 1 * * *'
-  # 允許你在 GitHub 介面上手動點擊執行測試
   workflow_dispatch:
 
 jobs:
   run-skill:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -20,32 +19,62 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          pip install requests
-          # 如果你的指令碼有其他套件，可以在這裡安裝，例如：
-          # pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
-      - name: Generate report
+      - name: Install Python dependencies
         run: |
-          {
-            echo "# AI Skill Report"
-            echo
-            echo "Generated at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo
-            echo '```json'
-            python scripts/crawl_news.py
-            echo '```'
-          } > skill_report.md
+          pip install -r requirements.txt
 
-      - name: Send MD File to Telegram
+      - name: Crawl news
+        run: python scripts/crawl_news.py --output news.json
+
+      - name: Generate Cantonese script
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+        run: python scripts/generate_script.py --news news.json --output podcast_script.md
+
+      - name: Synthesize podcast MP3
+        run: |
+          DATE_UTC=$(date -u +%Y%m%d)
+          python scripts/synthesize_podcast.py \
+            --script podcast_script.md \
+            --output "AI_Daily_Podcast_${DATE_UTC}.mp3"
+          echo "PODCAST_FILE=AI_Daily_Podcast_${DATE_UTC}.mp3" >> "$GITHUB_ENV"
+
+      - name: Send podcast to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          FILE_PATH="skill_report.md"
-          CAPTION="這是您定時生成的技能報告："
-          curl -F chat_id="$TELEGRAM_CHAT_ID" \
-               -F document=@"$FILE_PATH" \
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are required"
+            exit 1
+          fi
+
+          CAPTION="AI 日報 Podcast（自動生成）"
+          RESPONSE=$(curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+               -F document=@"$PODCAST_FILE" \
                -F caption="$CAPTION" \
-               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument"
+               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true'
+
+      - name: Send script markdown to Telegram
+        if: ${{ success() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+               -F document=@"podcast_script.md" \
+               -F caption="AI 日報腳本" \
+               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true'
