@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Cantonese podcast script via an OpenAI-compatible API (Ollama by default)."""
+"""Generate a Cantonese podcast script from crawled news via OpenAI-compatible API."""
 
 from __future__ import annotations
 
@@ -12,9 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import requests
-
-DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
-DEFAULT_MODEL = "qwen3.6:latest"
 
 SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 請用香港粵語口語（書面可以夾雜粵語詞），寫一段雙主持對話稿。
@@ -38,30 +35,6 @@ SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
-
-
-# #region agent log
-def debug_log(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
-    payload = {
-        "sessionId": "840db8",
-        "runId": os.getenv("GITHUB_RUN_ID", "local"),
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
-    }
-    line = json.dumps(payload, ensure_ascii=False)
-    print(f"DEBUG_840db8 {line}", file=sys.stderr)
-    try:
-        with open("debug-840db8.log", "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-    except OSError:
-        pass
-
-
-# #endregion
-
 
 def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
@@ -87,6 +60,7 @@ def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
             }
         )
 
+    # De-duplicate by link/title while preserving order.
     seen: set[str] = set()
     unique: list[dict[str, str]] = []
     for item in items:
@@ -118,106 +92,34 @@ def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
 
 def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
-    # #region agent log
-    debug_log(
-        "A",
-        "generate_script.py:call_openai:request",
-        "sending request",
-        {
-            "base_url": base_url,
-            "model": model,
-            "prompt_chars": len(user_prompt),
-            "api_key_present": bool(api_key),
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
         },
+        json={
+            "model": model,
+            "temperature": 0.7,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        },
+        timeout=180,
     )
-    # #endregion
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "temperature": 0.7,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-            timeout=600,
-        )
-    except requests.exceptions.ConnectionError as exc:
-        raise RuntimeError(
-            "Cannot reach Ollama at "
-            f"{base_url}. Is Docker Desktop running and is the Ollama "
-            "container publishing port 11434? "
-            "Try: curl http://127.0.0.1:11434/api/tags"
-        ) from exc
-    except requests.exceptions.Timeout as exc:
-        raise RuntimeError(
-            f"Timed out waiting for model response from {base_url} "
-            f"(model={model}). Try a smaller model or increase resources."
-        ) from exc
-
     if response.status_code >= 400:
         raise RuntimeError(
-            f"LLM API error {response.status_code}: {response.text[:1000]}"
+            f"OpenAI API error {response.status_code}: {response.text[:1000]}"
         )
 
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"LLM API returned non-JSON response: {response.text[:500]}"
-        ) from exc
-
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(f"LLM API error payload: {data}")
-
-    # #region agent log
-    choice0 = None
-    if isinstance(data, dict):
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            choice0 = choices[0]
-    message0 = choice0.get("message") if isinstance(choice0, dict) else None
-    content0 = message0.get("content") if isinstance(message0, dict) else None
-    debug_log(
-        "B,C,D",
-        "generate_script.py:call_openai:response",
-        "received response",
-        {
-            "top_keys": sorted(data.keys()) if isinstance(data, dict) else [],
-            "has_choices": isinstance(data, dict) and isinstance(data.get("choices"), list),
-            "choice_count": len(data.get("choices", [])) if isinstance(data, dict) and isinstance(data.get("choices"), list) else 0,
-            "message_keys": sorted(message0.keys()) if isinstance(message0, dict) else [],
-            "content_type": type(content0).__name__ if content0 is not None else "NoneType",
-            "content_len": len(content0) if isinstance(content0, str) else None,
-            "content_preview": content0[:200] if isinstance(content0, str) else str(content0)[:200],
-            "finish_reason": choice0.get("finish_reason") if isinstance(choice0, dict) else None,
-        },
-    )
-    # #endregion
-
+    data = response.json()
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"Unexpected API response: {data}") from exc
 
     if not content or not str(content).strip():
-        # #region agent log
-        debug_log(
-            "C,D",
-            "generate_script.py:call_openai:empty_content",
-            "content was empty after parsing",
-            {
-                "content_type": type(content).__name__,
-                "content_repr": repr(content)[:200],
-            },
-        )
-        # #endregion
         raise RuntimeError("API returned empty script content")
     return str(content).strip()
 
@@ -238,15 +140,17 @@ def main() -> None:
     parser.add_argument("--output", default="podcast_script.md")
     parser.add_argument(
         "--model",
-        default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
+        default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL),
+        default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
     )
     args = parser.parse_args()
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip() or "ollama"
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit("OPENAI_API_KEY is required")
 
     news_path = Path(args.news)
     if not news_path.exists():
@@ -256,7 +160,6 @@ def main() -> None:
     news_items = flatten_news(payload)
     date_label = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log(f"Using {len(news_items)} news items for script generation")
-    log(f"LLM endpoint={args.base_url} model={args.model}")
 
     script = call_openai(
         api_key=api_key,

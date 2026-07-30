@@ -8,11 +8,8 @@ on:
 
 jobs:
   run-skill:
-    runs-on: [self-hosted, Windows]
-    timeout-minutes: 120
-    defaults:
-      run:
-        shell: pwsh
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -22,123 +19,51 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Check host tools
+      - name: Install system dependencies
         run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($cmd in @('python')) {
-            if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
-              throw "$cmd is required on PATH for this self-hosted runner"
-            }
-            Write-Host "Found $cmd"
-          }
-          $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
-          if (-not $ffmpeg) {
-            $ffmpegExe = Get-ChildItem -Path 'C:\Program Files', 'C:\Program Files (x86)', 'C:\Users' -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.FullName -like '*\Microsoft\WinGet\Packages\Gyan.FFmpeg_*' -or
-                $_.FullName -like 'C:\Program Files\*'
-              } |
-              Select-Object -First 1
-            if (-not $ffmpegExe) {
-              throw 'ffmpeg is required on PATH for this self-hosted runner'
-            }
-            $ffmpegDir = Split-Path $ffmpegExe.FullName -Parent
-            Add-Content -Path $env:GITHUB_PATH -Value $ffmpegDir
-            $env:Path = "$ffmpegDir;$env:Path"
-            Write-Host "Using ffmpeg from $ffmpegDir"
-          } else {
-            Write-Host "Found ffmpeg"
-          }
-
-      - name: Check Docker Desktop and Ollama API
-        env:
-          OLLAMA_HOST: http://127.0.0.1:11434
-          OLLAMA_CONTAINER: ${{ vars.OLLAMA_CONTAINER || 'ollama' }}
-          OLLAMA_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen3.6:latest' }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          try {
-            $tags = Invoke-RestMethod -Uri "$env:OLLAMA_HOST/api/tags" -Method Get -TimeoutSec 10
-          } catch {
-            throw "Ollama API is not reachable at $env:OLLAMA_HOST. Is the Docker container running with -p 11434:11434? $_"
-          }
-          Write-Host "Ollama API is healthy"
-
-          $names = @()
-          if ($tags.models) {
-            $names = @($tags.models | ForEach-Object { $_.name })
-          }
-          Write-Host ("Installed models: " + (($names -join ', ') -replace '^$', '(none)'))
-
-          $wanted = $env:OLLAMA_MODEL
-          $have = $names | Where-Object {
-            $_ -eq $wanted -or $_ -like "$wanted`:*" -or ($_ -split ':')[0] -eq ($wanted -split ':')[0]
-          }
-          if (-not $have) {
-            Write-Host "Pulling model $wanted via HTTP /api/pull ..."
-            $body = @{ name = $wanted; stream = $false } | ConvertTo-Json
-            try {
-              Invoke-RestMethod -Uri "$env:OLLAMA_HOST/api/pull" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 3600 | Out-Null
-            } catch {
-              $docker = Get-Command docker -ErrorAction SilentlyContinue
-              if ($docker) {
-                Write-Host "HTTP pull failed; trying docker exec fallback..."
-                docker exec $env:OLLAMA_CONTAINER ollama pull $wanted
-                if ($LASTEXITCODE -ne 0) {
-                  throw "Failed to pull model $wanted"
-                }
-              } else {
-                throw "Failed to pull model $wanted via Ollama HTTP API, and docker CLI is unavailable for fallback"
-              }
-            }
-          } else {
-            Write-Host "Model already present: $wanted"
-          }
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
         run: |
-          python -m pip install -r requirements.txt
+          pip install -r requirements.txt
 
       - name: Crawl news
-        run: |
-          python scripts/crawl_news.py --output news.json
+        run: python scripts/crawl_news.py --output news.json
 
       - name: Generate Cantonese script
         env:
-          OPENAI_API_KEY: ollama
-          OPENAI_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen3.6:latest' }}
-          OPENAI_BASE_URL: http://127.0.0.1:11434/v1
-        run: |
-          python scripts/generate_script.py --news news.json --output podcast_script.md
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+        run: python scripts/generate_script.py --news news.json --output podcast_script.md
 
       - name: Synthesize podcast MP3
         run: |
-          $ErrorActionPreference = 'Stop'
-          $dateUtc = (Get-Date).ToUniversalTime().ToString('yyyyMMdd')
-          $podcast = "AI_Daily_Podcast_$dateUtc.mp3"
-          python scripts/synthesize_podcast.py --script podcast_script.md --output $podcast
-          "PODCAST_FILE=$podcast" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          DATE_UTC=$(date -u +%Y%m%d)
+          python scripts/synthesize_podcast.py \
+            --script podcast_script.md \
+            --output "AI_Daily_Podcast_${DATE_UTC}.mp3"
+          echo "PODCAST_FILE=AI_Daily_Podcast_${DATE_UTC}.mp3" >> "$GITHUB_ENV"
 
       - name: Send podcast to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_BOT_TOKEN) -or [string]::IsNullOrWhiteSpace($env:TELEGRAM_CHAT_ID)) {
-            throw 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are required'
-          }
-          if (-not (Test-Path $env:PODCAST_FILE)) {
-            throw "Podcast file not found: $($env:PODCAST_FILE)"
-          }
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets are required"
+            exit 1
+          fi
 
-          $caption = 'AI 日報 Podcast（自動生成）'
-          $uri = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendDocument"
-          $response = curl.exe -sS -F "chat_id=$($env:TELEGRAM_CHAT_ID)" -F "document=@$($env:PODCAST_FILE)" -F "caption=$caption" $uri
-          Write-Host $response
-          if ($response -notmatch '"ok"\s*:\s*true') {
-            throw 'Telegram sendDocument failed for podcast'
-          }
+          CAPTION="AI 日報 Podcast（自動生成）"
+          RESPONSE=$(curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+               -F document=@"$PODCAST_FILE" \
+               -F caption="$CAPTION" \
+               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true'
 
       - name: Send script markdown to Telegram
         if: ${{ success() }}
@@ -146,18 +71,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $uri = "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendDocument"
-          $response = curl.exe -sS -F "chat_id=$($env:TELEGRAM_CHAT_ID)" -F "document=@podcast_script.md" -F "caption=AI 日報腳本" $uri
-          Write-Host $response
-          if ($response -notmatch '"ok"\s*:\s*true') {
-            throw 'Telegram sendDocument failed for script'
-          }
-
-      - name: Upload debug log
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: debug-840db8
-          path: debug-840db8.log
-          if-no-files-found: ignore
+          set -euo pipefail
+          RESPONSE=$(curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+               -F document=@"podcast_script.md" \
+               -F caption="AI 日報腳本" \
+               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true'
