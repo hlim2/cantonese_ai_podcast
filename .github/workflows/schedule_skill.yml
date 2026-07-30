@@ -40,7 +40,7 @@ jobs:
 
       - name: Upload debug log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: debug-840db8
           path: debug-840db8.log
