@@ -25,7 +25,7 @@ jobs:
       - name: Check host tools
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($cmd in @('docker', 'python')) {
+          foreach ($cmd in @('python')) {
             if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
               throw "$cmd is required on PATH for this self-hosted runner"
             }
@@ -57,9 +57,6 @@ jobs:
           OLLAMA_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen3.6:latest' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          docker info | Out-Null
-          Write-Host "Docker is available"
-
           try {
             $tags = Invoke-RestMethod -Uri "$env:OLLAMA_HOST/api/tags" -Method Get -TimeoutSec 10
           } catch {
@@ -83,10 +80,15 @@ jobs:
             try {
               Invoke-RestMethod -Uri "$env:OLLAMA_HOST/api/pull" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 3600 | Out-Null
             } catch {
-              Write-Host "HTTP pull failed; trying docker exec fallback..."
-              docker exec $env:OLLAMA_CONTAINER ollama pull $wanted
-              if ($LASTEXITCODE -ne 0) {
-                throw "Failed to pull model $wanted"
+              $docker = Get-Command docker -ErrorAction SilentlyContinue
+              if ($docker) {
+                Write-Host "HTTP pull failed; trying docker exec fallback..."
+                docker exec $env:OLLAMA_CONTAINER ollama pull $wanted
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to pull model $wanted"
+                }
+              } else {
+                throw "Failed to pull model $wanted via Ollama HTTP API, and docker CLI is unavailable for fallback"
               }
             }
           } else {
