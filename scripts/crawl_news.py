@@ -171,7 +171,13 @@ def main():
         json.dump(results, handle, indent=2, ensure_ascii=False)
 
     log(f"Wrote {args.output}")
-    print(json.dumps(results, indent=2, ensure_ascii=False))
+
+    # Windows self-hosted runners may use a non-UTF-8 console code page.
+    output_json = json.dumps(results, indent=2, ensure_ascii=False)
+    try:
+        print(output_json)
+    except UnicodeEncodeError:
+        print(json.dumps(results, indent=2, ensure_ascii=True))
 
 
 if __name__ == "__main__":
