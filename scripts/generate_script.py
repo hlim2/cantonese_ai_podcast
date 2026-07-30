@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Cantonese podcast script from crawled news via OpenAI-compatible API."""
+"""Generate a Cantonese podcast script via an OpenAI-compatible API (Ollama by default)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_MODEL = "qwen2.5:7b"
 
 SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 請用香港粵語口語（書面可以夾雜粵語詞），寫一段雙主持對話稿。
@@ -35,38 +38,6 @@ SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
-
-
-# #region agent log
-def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
-    """Emit safe debug NDJSON to stderr + optional local log file. Never logs secrets."""
-    import time
-
-    payload = {
-        "sessionId": "840db8",
-        "runId": os.getenv("GITHUB_RUN_ID", "local"),
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    line = json.dumps(payload, ensure_ascii=False)
-    print(f"DEBUG_840db8 {line}", file=sys.stderr)
-    for candidate in (
-        Path("debug-840db8.log"),
-        Path(__file__).resolve().parents[2] / "debug-840db8.log",
-        Path("/home/runner/work/cantonese_ai_podcast/cantonese_ai_podcast/debug-840db8.log"),
-    ):
-        try:
-            with candidate.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-            break
-        except OSError:
-            continue
-
-
-# #endregion
 
 
 def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -93,7 +64,6 @@ def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
             }
         )
 
-    # De-duplicate by link/title while preserving order.
     seen: set[str] = set()
     unique: list[dict[str, str]] = []
     for item in items:
@@ -125,86 +95,51 @@ def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
 
 def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
-    # #region agent log
-    key_stripped = api_key.strip()
-    key_kind = (
-        "openai_sk"
-        if key_stripped.startswith("sk-")
-        else "empty"
-        if not key_stripped
-        else "other"
-    )
-    _agent_dbg(
-        "A,B,C",
-        "generate_script.py:call_openai:pre",
-        "auth request metadata",
-        {
-            "url": url,
-            "base_url": base_url,
-            "model": model,
-            "key_present": bool(key_stripped),
-            "key_length": len(key_stripped),
-            "key_kind": key_kind,
-            "key_has_whitespace": api_key != key_stripped,
-            "key_has_quotes": key_stripped[:1] in "'\"" or key_stripped[-1:] in "'\"",
-        },
-    )
-    # #endregion
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "temperature": 0.7,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
-        timeout=180,
-    )
-    # #region agent log
     try:
-        preview = response.json()
-        resp_keys = sorted(preview.keys()) if isinstance(preview, dict) else []
-        body_code = preview.get("code") if isinstance(preview, dict) else None
-        err = preview.get("error") if isinstance(preview, dict) else None
-        err_code = err.get("code") if isinstance(err, dict) else None
-        err_type = err.get("type") if isinstance(err, dict) else None
-        served_by = preview.get("served_by") if isinstance(preview, dict) else None
-        has_choices = isinstance(preview, dict) and "choices" in preview
-    except Exception as parse_exc:  # noqa: BLE001
-        resp_keys = []
-        body_code = None
-        err_code = None
-        err_type = None
-        served_by = None
-        has_choices = False
-        preview = {"_parse_error": str(parse_exc), "_text_prefix": response.text[:200]}
-    _agent_dbg(
-        "D,E",
-        "generate_script.py:call_openai:post",
-        "auth response metadata",
-        {
-            "http_status": response.status_code,
-            "resp_keys": resp_keys,
-            "body_code": body_code,
-            "error_code": err_code,
-            "error_type": err_type,
-            "served_by": served_by,
-            "has_choices": has_choices,
-        },
-    )
-    # #endregion
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0.7,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+            timeout=600,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            "Cannot reach Ollama at "
+            f"{base_url}. Is Docker Desktop running and is the Ollama "
+            "container publishing port 11434? "
+            "Try: curl http://127.0.0.1:11434/api/tags"
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            f"Timed out waiting for model response from {base_url} "
+            f"(model={model}). Try a smaller model or increase resources."
+        ) from exc
+
     if response.status_code >= 400:
         raise RuntimeError(
-            f"OpenAI API error {response.status_code}: {response.text[:1000]}"
+            f"LLM API error {response.status_code}: {response.text[:1000]}"
         )
 
-    data = response.json() if not isinstance(preview, dict) or "_parse_error" in preview else preview
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"LLM API returned non-JSON response: {response.text[:500]}"
+        ) from exc
+
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"LLM API error payload: {data}")
+
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -231,17 +166,15 @@ def main() -> None:
     parser.add_argument("--output", default="podcast_script.md")
     parser.add_argument(
         "--model",
-        default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        default=os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL),
     )
     args = parser.parse_args()
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY is required")
+    api_key = os.getenv("OPENAI_API_KEY", "").strip() or "ollama"
 
     news_path = Path(args.news)
     if not news_path.exists():
@@ -251,6 +184,7 @@ def main() -> None:
     news_items = flatten_news(payload)
     date_label = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log(f"Using {len(news_items)} news items for script generation")
+    log(f"LLM endpoint={args.base_url} model={args.model}")
 
     script = call_openai(
         api_key=api_key,
