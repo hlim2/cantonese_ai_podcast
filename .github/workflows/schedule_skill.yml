@@ -38,6 +38,14 @@ jobs:
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
         run: python scripts/generate_script.py --news news.json --output podcast_script.md
 
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-840db8
+          path: debug-840db8.log
+          if-no-files-found: ignore
+
       - name: Synthesize podcast MP3
         run: |
           DATE_UTC=$(date -u +%Y%m%d)

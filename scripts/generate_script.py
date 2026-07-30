@@ -37,6 +37,38 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+# #region agent log
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    """Emit safe debug NDJSON to stderr + optional local log file. Never logs secrets."""
+    import time
+
+    payload = {
+        "sessionId": "840db8",
+        "runId": os.getenv("GITHUB_RUN_ID", "local"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    line = json.dumps(payload, ensure_ascii=False)
+    print(f"DEBUG_840db8 {line}", file=sys.stderr)
+    for candidate in (
+        Path("debug-840db8.log"),
+        Path(__file__).resolve().parents[2] / "debug-840db8.log",
+        Path("/home/runner/work/cantonese_ai_podcast/cantonese_ai_podcast/debug-840db8.log"),
+    ):
+        try:
+            with candidate.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+            break
+        except OSError:
+            continue
+
+
+# #endregion
+
+
 def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
 
@@ -93,6 +125,31 @@ def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
 
 def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
+    # #region agent log
+    key_stripped = api_key.strip()
+    key_kind = (
+        "openai_sk"
+        if key_stripped.startswith("sk-")
+        else "empty"
+        if not key_stripped
+        else "other"
+    )
+    _agent_dbg(
+        "A,B,C",
+        "generate_script.py:call_openai:pre",
+        "auth request metadata",
+        {
+            "url": url,
+            "base_url": base_url,
+            "model": model,
+            "key_present": bool(key_stripped),
+            "key_length": len(key_stripped),
+            "key_kind": key_kind,
+            "key_has_whitespace": api_key != key_stripped,
+            "key_has_quotes": key_stripped[:1] in "'\"" or key_stripped[-1:] in "'\"",
+        },
+    )
+    # #endregion
     response = requests.post(
         url,
         headers={
@@ -109,12 +166,45 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
         },
         timeout=180,
     )
+    # #region agent log
+    try:
+        preview = response.json()
+        resp_keys = sorted(preview.keys()) if isinstance(preview, dict) else []
+        body_code = preview.get("code") if isinstance(preview, dict) else None
+        err = preview.get("error") if isinstance(preview, dict) else None
+        err_code = err.get("code") if isinstance(err, dict) else None
+        err_type = err.get("type") if isinstance(err, dict) else None
+        served_by = preview.get("served_by") if isinstance(preview, dict) else None
+        has_choices = isinstance(preview, dict) and "choices" in preview
+    except Exception as parse_exc:  # noqa: BLE001
+        resp_keys = []
+        body_code = None
+        err_code = None
+        err_type = None
+        served_by = None
+        has_choices = False
+        preview = {"_parse_error": str(parse_exc), "_text_prefix": response.text[:200]}
+    _agent_dbg(
+        "D,E",
+        "generate_script.py:call_openai:post",
+        "auth response metadata",
+        {
+            "http_status": response.status_code,
+            "resp_keys": resp_keys,
+            "body_code": body_code,
+            "error_code": err_code,
+            "error_type": err_type,
+            "served_by": served_by,
+            "has_choices": has_choices,
+        },
+    )
+    # #endregion
     if response.status_code >= 400:
         raise RuntimeError(
             f"OpenAI API error {response.status_code}: {response.text[:1000]}"
         )
 
-    data = response.json()
+    data = response.json() if not isinstance(preview, dict) or "_parse_error" in preview else preview
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
