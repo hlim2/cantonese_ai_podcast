@@ -25,11 +25,26 @@ jobs:
       - name: Check host tools
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($cmd in @('docker', 'ffmpeg', 'python')) {
+          foreach ($cmd in @('docker', 'python')) {
             if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
               throw "$cmd is required on PATH for this self-hosted runner"
             }
             Write-Host "Found $cmd"
+          }
+          $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+          if (-not $ffmpeg) {
+            $ffmpegExe = Get-ChildItem -Path 'C:\Users' -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -like '*\Microsoft\WinGet\Packages\Gyan.FFmpeg_*' } |
+              Select-Object -First 1
+            if (-not $ffmpegExe) {
+              throw 'ffmpeg is required on PATH for this self-hosted runner'
+            }
+            $ffmpegDir = Split-Path $ffmpegExe.FullName -Parent
+            Add-Content -Path $env:GITHUB_PATH -Value $ffmpegDir
+            $env:Path = "$ffmpegDir;$env:Path"
+            Write-Host "Using ffmpeg from $ffmpegDir"
+          } else {
+            Write-Host "Found ffmpeg"
           }
 
       - name: Check Docker Desktop and Ollama API
