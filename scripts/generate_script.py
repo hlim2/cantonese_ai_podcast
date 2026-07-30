@@ -40,6 +40,29 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+# #region agent log
+def debug_log(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    payload = {
+        "sessionId": "840db8",
+        "runId": os.getenv("GITHUB_RUN_ID", "local"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+    }
+    line = json.dumps(payload, ensure_ascii=False)
+    print(f"DEBUG_840db8 {line}", file=sys.stderr)
+    try:
+        with open("debug-840db8.log", "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+# #endregion
+
+
 def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
 
@@ -95,6 +118,19 @@ def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
 
 def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
+    # #region agent log
+    debug_log(
+        "A",
+        "generate_script.py:call_openai:request",
+        "sending request",
+        {
+            "base_url": base_url,
+            "model": model,
+            "prompt_chars": len(user_prompt),
+            "api_key_present": bool(api_key),
+        },
+    )
+    # #endregion
     try:
         response = requests.post(
             url,
@@ -140,12 +176,48 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
     if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(f"LLM API error payload: {data}")
 
+    # #region agent log
+    choice0 = None
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            choice0 = choices[0]
+    message0 = choice0.get("message") if isinstance(choice0, dict) else None
+    content0 = message0.get("content") if isinstance(message0, dict) else None
+    debug_log(
+        "B,C,D",
+        "generate_script.py:call_openai:response",
+        "received response",
+        {
+            "top_keys": sorted(data.keys()) if isinstance(data, dict) else [],
+            "has_choices": isinstance(data, dict) and isinstance(data.get("choices"), list),
+            "choice_count": len(data.get("choices", [])) if isinstance(data, dict) and isinstance(data.get("choices"), list) else 0,
+            "message_keys": sorted(message0.keys()) if isinstance(message0, dict) else [],
+            "content_type": type(content0).__name__ if content0 is not None else "NoneType",
+            "content_len": len(content0) if isinstance(content0, str) else None,
+            "content_preview": content0[:200] if isinstance(content0, str) else str(content0)[:200],
+            "finish_reason": choice0.get("finish_reason") if isinstance(choice0, dict) else None,
+        },
+    )
+    # #endregion
+
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"Unexpected API response: {data}") from exc
 
     if not content or not str(content).strip():
+        # #region agent log
+        debug_log(
+            "C,D",
+            "generate_script.py:call_openai:empty_content",
+            "content was empty after parsing",
+            {
+                "content_type": type(content).__name__,
+                "content_repr": repr(content)[:200],
+            },
+        )
+        # #endregion
         raise RuntimeError("API returned empty script content")
     return str(content).strip()
 

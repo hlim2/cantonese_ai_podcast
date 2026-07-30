@@ -153,3 +153,11 @@ jobs:
           if ($response -notmatch '"ok"\s*:\s*true') {
             throw 'Telegram sendDocument failed for script'
           }
+
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: debug-840db8
+          path: debug-840db8.log
+          if-no-files-found: ignore
