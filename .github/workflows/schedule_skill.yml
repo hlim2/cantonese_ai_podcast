@@ -33,8 +33,11 @@ jobs:
           }
           $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
           if (-not $ffmpeg) {
-            $ffmpegExe = Get-ChildItem -Path 'C:\Users' -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -like '*\Microsoft\WinGet\Packages\Gyan.FFmpeg_*' } |
+            $ffmpegExe = Get-ChildItem -Path 'C:\Program Files', 'C:\Program Files (x86)', 'C:\Users' -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.FullName -like '*\Microsoft\WinGet\Packages\Gyan.FFmpeg_*' -or
+                $_.FullName -like 'C:\Program Files\*'
+              } |
               Select-Object -First 1
             if (-not $ffmpegExe) {
               throw 'ffmpeg is required on PATH for this self-hosted runner'
