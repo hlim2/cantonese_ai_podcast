@@ -36,7 +36,7 @@ jobs:
         env:
           OLLAMA_HOST: http://127.0.0.1:11434
           OLLAMA_CONTAINER: ${{ vars.OLLAMA_CONTAINER || 'ollama' }}
-          OLLAMA_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen2.5:7b' }}
+          OLLAMA_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen3.6:latest' }}
         run: |
           $ErrorActionPreference = 'Stop'
           docker info | Out-Null
@@ -86,7 +86,7 @@ jobs:
       - name: Generate Cantonese script
         env:
           OPENAI_API_KEY: ollama
-          OPENAI_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen2.5:7b' }}
+          OPENAI_MODEL: ${{ vars.OLLAMA_MODEL || 'qwen3.6:latest' }}
           OPENAI_BASE_URL: http://127.0.0.1:11434/v1
         run: |
           python scripts/generate_script.py --news news.json --output podcast_script.md

@@ -14,7 +14,7 @@ from typing import Any
 import requests
 
 DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
-DEFAULT_MODEL = "qwen2.5:7b"
+DEFAULT_MODEL = "qwen3.6:latest"
 
 SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 請用香港粵語口語（書面可以夾雜粵語詞），寫一段雙主持對話稿。
