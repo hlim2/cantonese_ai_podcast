@@ -33,10 +33,13 @@ jobs:
 
       - name: Generate Cantonese script
         env:
+          # APIFree / SkyClaw defaults. Override with repo Variables if needed.
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
-        run: python scripts/generate_script.py --news news.json --output podcast_script.md
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'skywork-ai/skyclaw-v1-lite' }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.apifree.ai/v1' }}
+        run: |
+          echo "Using model=$OPENAI_MODEL base_url=$OPENAI_BASE_URL"
+          python scripts/generate_script.py --news news.json --output podcast_script.md
 
       - name: Synthesize podcast MP3
         run: |

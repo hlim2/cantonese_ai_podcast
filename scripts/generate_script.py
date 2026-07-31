@@ -92,6 +92,7 @@ def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
 
 def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
+    log(f"LLM endpoint={base_url} model={model}")
     response = requests.post(
         url,
         headers={
@@ -108,16 +109,33 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
         },
         timeout=180,
     )
-    if response.status_code >= 400:
+    try:
+        data = response.json()
+    except ValueError as exc:
         raise RuntimeError(
-            f"OpenAI API error {response.status_code}: {response.text[:1000]}"
+            f"API returned non-JSON (HTTP {response.status_code}): {response.text[:1000]}"
+        ) from exc
+
+    # APIFree sometimes returns HTTP 200 with an error payload.
+    if isinstance(data, dict) and (
+        data.get("error")
+        or (isinstance(data.get("code"), int) and int(data["code"]) >= 400)
+    ):
+        raise RuntimeError(
+            f"API error (HTTP {response.status_code}, model={model}): {data}"
         )
 
-    data = response.json()
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"API error {response.status_code} (model={model}): {response.text[:1000]}"
+        )
+
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected API response: {data}") from exc
+        raise RuntimeError(
+            f"Unexpected API response (model={model}): {data}"
+        ) from exc
 
     if not content or not str(content).strip():
         raise RuntimeError("API returned empty script content")
@@ -140,11 +158,11 @@ def main() -> None:
     parser.add_argument("--output", default="podcast_script.md")
     parser.add_argument(
         "--model",
-        default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        default=os.getenv("OPENAI_MODEL", "skywork-ai/skyclaw-v1-lite"),
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/v1"),
     )
     args = parser.parse_args()
 
