@@ -24,6 +24,10 @@ SPEAKER_VOICES = {
     "阿明": os.getenv("VOICE_AH_MING", "zh-HK-WanLungNeural"),
 }
 
+# Slightly slower / warmer pacing for less mechanical delivery.
+TTS_RATE = os.getenv("TTS_RATE", "-8%")
+TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz")
+
 LINE_RE = re.compile(r"^(阿希|阿明)\s*[:：]\s*(.+)$")
 # Characters that often break Edge TTS / SSML parsing.
 UNSAFE_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f<>&]")
@@ -78,7 +82,12 @@ def sanitize_tts_text(text: str) -> str:
 
 
 async def synthesize_line(text: str, voice: str, output_path: Path) -> None:
-    communicate = edge_tts.Communicate(text, voice=voice)
+    communicate = edge_tts.Communicate(
+        text,
+        voice=voice,
+        rate=TTS_RATE,
+        pitch=TTS_PITCH,
+    )
     await communicate.save(str(output_path))
 
 
