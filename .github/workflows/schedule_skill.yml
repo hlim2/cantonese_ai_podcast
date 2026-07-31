@@ -41,6 +41,14 @@ jobs:
           echo "Using model=$OPENAI_MODEL base_url=$OPENAI_BASE_URL"
           python scripts/generate_script.py --news news.json --output podcast_script.md
 
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: debug-840db8
+          path: debug-840db8.log
+          if-no-files-found: ignore
+
       - name: Synthesize podcast MP3
         run: |
           DATE_UTC=$(date -u +%Y%m%d)

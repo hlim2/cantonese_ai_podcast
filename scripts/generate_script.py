@@ -36,6 +36,111 @@ SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 def log(message: str) -> None:
     print(message, file=sys.stderr)
 
+
+# #region agent log
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    """Safe NDJSON debug to stderr + local file. Never logs secrets."""
+    import time
+
+    payload = {
+        "sessionId": "840db8",
+        "runId": os.getenv("GITHUB_RUN_ID", "local"),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    line = json.dumps(payload, ensure_ascii=False)
+    print(f"DEBUG_840db8 {line}", file=sys.stderr)
+    try:
+        with open("debug-840db8.log", "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _probe_endpoint(api_key: str, base_url: str, model: str) -> dict[str, Any]:
+    """Tiny probe to see whether a base URL accepts the model."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+            },
+            timeout=60,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            return {
+                "base_url": base_url,
+                "http_status": response.status_code,
+                "json": False,
+                "text_prefix": response.text[:120],
+            }
+        err = data.get("error") if isinstance(data, dict) else None
+        return {
+            "base_url": base_url,
+            "http_status": response.status_code,
+            "json": True,
+            "has_choices": isinstance(data, dict) and "choices" in data,
+            "body_code": data.get("code") if isinstance(data, dict) else None,
+            "error_code": err.get("code") if isinstance(err, dict) else None,
+            "error_message": err.get("message") if isinstance(err, dict) else None,
+            "served_by": data.get("served_by") if isinstance(data, dict) else None,
+        }
+    except requests.RequestException as exc:
+        return {"base_url": base_url, "exception": type(exc).__name__, "msg": str(exc)[:160]}
+
+
+def _list_models(api_key: str, base_url: str) -> dict[str, Any]:
+    url = base_url.rstrip("/") + "/models"
+    try:
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            return {
+                "base_url": base_url,
+                "http_status": response.status_code,
+                "json": False,
+                "text_prefix": response.text[:120],
+            }
+        ids: list[str] = []
+        if isinstance(data, dict):
+            for item in data.get("data") or []:
+                if isinstance(item, dict) and item.get("id"):
+                    ids.append(str(item["id"]))
+        skyclaw = [mid for mid in ids if "skyclaw" in mid.lower() or "skywork" in mid.lower()]
+        return {
+            "base_url": base_url,
+            "http_status": response.status_code,
+            "json": True,
+            "model_count": len(ids),
+            "skyclaw_or_skywork_ids": skyclaw[:30],
+            "sample_ids": ids[:20],
+            "body_code": data.get("code") if isinstance(data, dict) else None,
+            "error": data.get("error") if isinstance(data, dict) else None,
+        }
+    except requests.RequestException as exc:
+        return {"base_url": base_url, "exception": type(exc).__name__, "msg": str(exc)[:160]}
+
+
+# #endregion
+
+
 def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
 
@@ -93,6 +198,22 @@ def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
 def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
     log(f"LLM endpoint={base_url} model={model}")
+    # #region agent log
+    _agent_dbg(
+        "A,B",
+        "generate_script.py:call_openai:pre",
+        "request metadata",
+        {
+            "url": url,
+            "base_url": base_url,
+            "model": model,
+            "base_has_agent": "/agent" in base_url,
+            "prompt_chars": len(user_prompt),
+            "key_present": bool(api_key),
+            "key_length": len(api_key),
+        },
+    )
+    # #endregion
     response = requests.post(
         url,
         headers={
@@ -116,11 +237,64 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
             f"API returned non-JSON (HTTP {response.status_code}): {response.text[:1000]}"
         ) from exc
 
+    # #region agent log
+    err = data.get("error") if isinstance(data, dict) else None
+    _agent_dbg(
+        "A,B,C",
+        "generate_script.py:call_openai:post",
+        "response metadata",
+        {
+            "http_status": response.status_code,
+            "has_choices": isinstance(data, dict) and "choices" in data,
+            "body_code": data.get("code") if isinstance(data, dict) else None,
+            "error_code": err.get("code") if isinstance(err, dict) else None,
+            "error_message": err.get("message") if isinstance(err, dict) else None,
+            "served_by": data.get("served_by") if isinstance(data, dict) else None,
+            "top_keys": sorted(data.keys()) if isinstance(data, dict) else [],
+        },
+    )
+    # #endregion
+
     # APIFree sometimes returns HTTP 200 with an error payload.
     if isinstance(data, dict) and (
         data.get("error")
         or (isinstance(data.get("code"), int) and int(data["code"]) >= 400)
     ):
+        # #region agent log
+        err_msg = ""
+        if isinstance(data.get("error"), dict):
+            err_msg = str(data["error"].get("message") or "")
+        if "model schema not found" in err_msg.lower() or data.get("code") == 500:
+            candidates = [
+                "https://api.apifree.ai/agent/v1",
+                "https://api.apifree.ai/v1",
+            ]
+            # Also try alternate model id spellings against the primary base.
+            model_alts = [
+                model,
+                "skywork-ai/skyclaw-v1",
+                "skywork-ai/skyclaw-v1-lite",
+                "skyclaw-v1-lite",
+                "skyclaw-v1",
+            ]
+            probes = []
+            for candidate in candidates:
+                probes.append(_list_models(api_key, candidate))
+                probes.append(_probe_endpoint(api_key, candidate, model))
+            for alt_model in model_alts:
+                if alt_model == model:
+                    continue
+                probes.append(_probe_endpoint(api_key, base_url, alt_model))
+                probes.append(
+                    _probe_endpoint(api_key, "https://api.apifree.ai/agent/v1", alt_model)
+                )
+            _agent_dbg(
+                "A,B,D,E",
+                "generate_script.py:call_openai:schema_probe",
+                "probed alternate endpoints/models after schema error",
+                {"probes": probes},
+            )
+        # #endregion
         raise RuntimeError(
             f"API error (HTTP {response.status_code}, model={model}): {data}"
         )
