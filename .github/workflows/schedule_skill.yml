@@ -70,13 +70,84 @@ jobs:
             exit 1
           fi
 
+          # Normalize common secret paste mistakes.
+          CHAT_ID="$(printf '%s' "$TELEGRAM_CHAT_ID" | tr -d '[:space:]' | sed 's/^["'\'']//; s/["'\'']$//')"
+          export CHAT_ID
+          # #region agent log
+          python - <<'PY'
+          import json, os, time, urllib.request
+          chat = os.environ.get("CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID", "")
+          chat = chat.strip().strip('"').strip("'")
+          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+          payload = {
+            "sessionId": "840db8",
+            "runId": os.environ.get("GITHUB_RUN_ID", "local"),
+            "hypothesisId": "TG-A,TG-B,TG-C",
+            "location": "workflow:send_podcast:pre",
+            "message": "telegram chat id metadata",
+            "data": {
+              "chat_len": len(chat),
+              "chat_is_numeric": chat.lstrip("-").isdigit(),
+              "chat_starts_at": chat.startswith("@"),
+              "chat_looks_negative_group": chat.startswith("-"),
+              "chat_has_quotes_or_space": any(c in (os.environ.get("TELEGRAM_CHAT_ID") or "") for c in ' "\''),
+              "podcast_exists": os.path.exists(os.environ.get("PODCAST_FILE", "")),
+              "podcast_file": os.environ.get("PODCAST_FILE", ""),
+            },
+            "timestamp": int(time.time() * 1000),
+          }
+          print("DEBUG_840db8 " + json.dumps(payload, ensure_ascii=False), flush=True)
+          try:
+            with open("debug-840db8.log", "a", encoding="utf-8") as f:
+              f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+          except OSError:
+            pass
+          # Safe bot identity check.
+          with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=20) as resp:
+            me = json.load(resp)
+          bot_payload = {
+            "sessionId": "840db8",
+            "runId": os.environ.get("GITHUB_RUN_ID", "local"),
+            "hypothesisId": "TG-D",
+            "location": "workflow:send_podcast:getMe",
+            "message": "telegram getMe",
+            "data": {
+              "ok": me.get("ok"),
+              "bot_username": (me.get("result") or {}).get("username"),
+              "bot_id": (me.get("result") or {}).get("id"),
+            },
+            "timestamp": int(time.time() * 1000),
+          }
+          print("DEBUG_840db8 " + json.dumps(bot_payload, ensure_ascii=False), flush=True)
+          try:
+            with open("debug-840db8.log", "a", encoding="utf-8") as f:
+              f.write(json.dumps(bot_payload, ensure_ascii=False) + "\n")
+          except OSError:
+            pass
+          PY
+          # #endregion
+
+          if [ ! -f "$PODCAST_FILE" ]; then
+            echo "Podcast file missing: $PODCAST_FILE"
+            exit 1
+          fi
+
           CAPTION="AI 日報 Podcast（自動生成）"
-          RESPONSE=$(curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+          RESPONSE=$(curl -sS -F chat_id="$CHAT_ID" \
                -F document=@"$PODCAST_FILE" \
                -F caption="$CAPTION" \
                "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument")
           echo "$RESPONSE"
-          echo "$RESPONSE" | grep -q '"ok":true'
+          # #region agent log
+          echo "$RESPONSE" | python -c 'import json,sys,time,os; r=json.load(sys.stdin); p={"sessionId":"840db8","runId":os.environ.get("GITHUB_RUN_ID","local"),"hypothesisId":"TG-A,TG-B,TG-C","location":"workflow:send_podcast:post","message":"telegram sendDocument result","data":{"ok":r.get("ok"),"error_code":r.get("error_code"),"description":r.get("description")},"timestamp":int(time.time()*1000)}; print("DEBUG_840db8 "+json.dumps(p,ensure_ascii=False)); open("debug-840db8.log","a",encoding="utf-8").write(json.dumps(p,ensure_ascii=False)+"\n")'
+          # #endregion
+          if ! echo "$RESPONSE" | grep -q '"ok":true'; then
+            echo "Telegram send failed. Common fixes:"
+            echo "1) Open your bot in Telegram and tap Start"
+            echo "2) Set TELEGRAM_CHAT_ID to your numeric user/chat id (groups often start with -100...)"
+            echo "3) Do not put quotes/spaces in the secret value"
+            exit 1
+          fi
 
       - name: Send script markdown to Telegram
         if: ${{ success() }}
@@ -85,7 +156,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
-          RESPONSE=$(curl -sS -F chat_id="$TELEGRAM_CHAT_ID" \
+          CHAT_ID="$(printf '%s' "$TELEGRAM_CHAT_ID" | tr -d '[:space:]' | sed 's/^["'\'']//; s/["'\'']$//')"
+          RESPONSE=$(curl -sS -F chat_id="$CHAT_ID" \
                -F document=@"podcast_script.md" \
                -F caption="AI 日報腳本" \
                "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument")
