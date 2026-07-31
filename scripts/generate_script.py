@@ -336,7 +336,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/v1"),
+        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/agent/v1"),
     )
     args = parser.parse_args()
 
