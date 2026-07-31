@@ -9,7 +9,7 @@ on:
 jobs:
   run-skill:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -46,7 +46,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: debug-840db8
-          path: debug-840db8.log
+          path: |
+            debug-840db8.log
+            podcast_script.md
           if-no-files-found: ignore
 
       - name: Synthesize podcast MP3
