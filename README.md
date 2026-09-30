@@ -36,5 +36,8 @@ the **MP3**
 the **script** (podcast_script.md)
 using secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
 
+TELEGRAM_CHAT_ID = Telegram group/channel ID, check ID with @IDBot
+TELEGRAM_BOT_TOKEN = Bot ID, check ID with @BotFather or @IDBot
+
 That’s the full path: **crawled news + 編劇 prompt → SkyClaw script → Cantonese TTS → Telegram files.**
 **
