@@ -79,6 +79,8 @@ def _probe_endpoint(api_key: str, base_url: str, model: str) -> dict[str, Any]:
             json={
                 "model": model,
                 "temperature": 0,
+                # Required by APIFree for Qwen3; harmless for other chat models.
+                "enable_thinking": False,
                 "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
             },
             timeout=60,
@@ -229,6 +231,8 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
         json={
             "model": model,
             "temperature": 0.7,
+            # Required by APIFree for Qwen3; harmless for other chat models.
+            "enable_thinking": False,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
