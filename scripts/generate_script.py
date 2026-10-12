@@ -185,43 +185,60 @@ def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     return unique
 
 
-def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
-    if not news_items:
-        news_block = "（今日未能抓到足夠新聞，請做一集簡短 AI 日報開場+市場觀察+結尾，仍用阿希/阿明格式。）"
-    else:
-        lines = []
-        for idx, item in enumerate(news_items[:12], start=1):
-            lines.append(
-                f"{idx}. [{item['source']}] {item['title']}\n   URL: {item['link']}"
-            )
-        news_block = "\n".join(lines)
+def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
+    """True when retrying another apifree model/base URL may succeed."""
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get("code"), int) and int(data["code"]) >= 400:
+        return True
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return False
+    code = str(err.get("code") or "").lower()
+    msg = str(err.get("message") or "").lower()
+    if code in ("model_not_found", "model_schema_not_found"):
+        return True
+    if "model schema not found" in msg or "model not exist" in msg:
+        return True
+    return False
 
-    return (
-        f"日期：{date_label}\n"
-        "請根據以下新聞素材撰寫今日粵語 Podcast 對話稿：\n\n"
-        f"{news_block}\n"
-    )
+
+def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]]:
+    """Ordered (base_url, model) pairs to try after the primary config fails."""
+    seen: set[tuple[str, str]] = set()
+    ordered: list[tuple[str, str]] = []
+
+    def add(url: str, mid: str) -> None:
+        key = (url.rstrip("/"), mid)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(key)
+
+    add(base_url, model)
+    if "apifree.ai" not in base_url.lower():
+        return ordered
+    for url in (
+        "https://api.apifree.ai/agent/v1",
+        "https://api.apifree.ai/v1",
+    ):
+        for mid in (
+            "skywork-ai/skyclaw-v1-lite",
+            "skywork-ai/skyclaw-v1",
+            "skyclaw-v1-lite",
+            "skyclaw-v1",
+        ):
+            add(url, mid)
+    return ordered
 
 
-def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
+def _chat_completion(
+    api_key: str,
+    model: str,
+    base_url: str,
+    user_prompt: str,
+) -> tuple[requests.Response, dict[str, Any]]:
     url = base_url.rstrip("/") + "/chat/completions"
-    log(f"LLM endpoint={base_url} model={model}")
-    # #region agent log
-    _agent_dbg(
-        "A,B",
-        "generate_script.py:call_openai:pre",
-        "request metadata",
-        {
-            "url": url,
-            "base_url": base_url,
-            "model": model,
-            "base_has_agent": "/agent" in base_url,
-            "prompt_chars": len(user_prompt),
-            "key_present": bool(api_key),
-            "key_length": len(api_key),
-        },
-    )
-    # #endregion
     response = requests.post(
         url,
         headers={
@@ -246,84 +263,165 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
         raise RuntimeError(
             f"API returned non-JSON (HTTP {response.status_code}): {response.text[:1000]}"
         ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Unexpected API response type (model={model}): {data!r}"
+        )
+    return response, data
+
+
+def build_user_prompt(news_items: list[dict[str, str]], date_label: str) -> str:
+    if not news_items:
+        news_block = "（今日未能抓到足夠新聞，請做一集簡短 AI 日報開場+市場觀察+結尾，仍用阿希/阿明格式。）"
+    else:
+        lines = []
+        for idx, item in enumerate(news_items[:12], start=1):
+            lines.append(
+                f"{idx}. [{item['source']}] {item['title']}\n   URL: {item['link']}"
+            )
+        news_block = "\n".join(lines)
+
+    return (
+        f"日期：{date_label}\n"
+        "請根據以下新聞素材撰寫今日粵語 Podcast 對話稿：\n\n"
+        f"{news_block}\n"
+    )
+
+
+def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> str:
+    last_error: dict[str, Any] | None = None
+    last_status = 0
+    tried: list[dict[str, str]] = []
+
+    for attempt_base, attempt_model in _apifree_fallback_configs(model, base_url):
+        url = attempt_base.rstrip("/") + "/chat/completions"
+        is_primary = attempt_base.rstrip("/") == base_url.rstrip("/") and attempt_model == model
+        if is_primary:
+            log(f"LLM endpoint={attempt_base} model={attempt_model}")
+        else:
+            log(
+                f"Retrying LLM endpoint={attempt_base} model={attempt_model} "
+                f"(primary was {base_url} / {model})"
+            )
+        tried.append({"base_url": attempt_base, "model": attempt_model})
+
+        # #region agent log
+        _agent_dbg(
+            "A,B",
+            "generate_script.py:call_openai:pre",
+            "request metadata",
+            {
+                "url": url,
+                "base_url": attempt_base,
+                "model": attempt_model,
+                "base_has_agent": "/agent" in attempt_base,
+                "prompt_chars": len(user_prompt),
+                "key_present": bool(api_key),
+                "key_length": len(api_key),
+                "is_primary": is_primary,
+            },
+        )
+        # #endregion
+
+        response, data = _chat_completion(
+            api_key, attempt_model, attempt_base, user_prompt
+        )
+
+        # #region agent log
+        err = data.get("error")
+        _agent_dbg(
+            "A,B,C",
+            "generate_script.py:call_openai:post",
+            "response metadata",
+            {
+                "http_status": response.status_code,
+                "has_choices": "choices" in data,
+                "body_code": data.get("code"),
+                "error_code": err.get("code") if isinstance(err, dict) else None,
+                "error_message": err.get("message") if isinstance(err, dict) else None,
+                "served_by": data.get("served_by"),
+                "top_keys": sorted(data.keys()),
+                "model": attempt_model,
+                "base_url": attempt_base,
+            },
+        )
+        # #endregion
+
+        if response.status_code >= 400:
+            last_error = data
+            last_status = response.status_code
+            continue
+
+        if data.get("error") or (
+            isinstance(data.get("code"), int) and int(data["code"]) >= 400
+        ):
+            last_error = data
+            last_status = response.status_code
+            if _is_recoverable_apifree_error(data):
+                continue
+            break
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            last_error = data
+            last_status = response.status_code
+            if _is_recoverable_apifree_error(data):
+                continue
+            raise RuntimeError(
+                f"Unexpected API response (model={attempt_model}): {data}"
+            ) from exc
+
+        if not content or not str(content).strip():
+            last_error = {"error": {"message": "empty content"}}
+            last_status = response.status_code
+            continue
+
+        if not is_primary:
+            log(
+                f"Recovered using fallback LLM config: {attempt_base} / {attempt_model}"
+            )
+        return str(content).strip()
 
     # #region agent log
-    err = data.get("error") if isinstance(data, dict) else None
-    _agent_dbg(
-        "A,B,C",
-        "generate_script.py:call_openai:post",
-        "response metadata",
-        {
-            "http_status": response.status_code,
-            "has_choices": isinstance(data, dict) and "choices" in data,
-            "body_code": data.get("code") if isinstance(data, dict) else None,
-            "error_code": err.get("code") if isinstance(err, dict) else None,
-            "error_message": err.get("message") if isinstance(err, dict) else None,
-            "served_by": data.get("served_by") if isinstance(data, dict) else None,
-            "top_keys": sorted(data.keys()) if isinstance(data, dict) else [],
-        },
-    )
+    err_msg = ""
+    if isinstance(last_error, dict) and isinstance(last_error.get("error"), dict):
+        err_msg = str(last_error["error"].get("message") or "")
+    if _is_recoverable_apifree_error(last_error or {}):
+        candidates = [
+            "https://api.apifree.ai/agent/v1",
+            "https://api.apifree.ai/v1",
+        ]
+        model_alts = [
+            model,
+            "skywork-ai/skyclaw-v1",
+            "skywork-ai/skyclaw-v1-lite",
+            "skyclaw-v1-lite",
+            "skyclaw-v1",
+        ]
+        probes = []
+        for candidate in candidates:
+            probes.append(_list_models(api_key, candidate))
+            probes.append(_probe_endpoint(api_key, candidate, model))
+        for alt_model in model_alts:
+            if alt_model == model:
+                continue
+            probes.append(_probe_endpoint(api_key, base_url, alt_model))
+            probes.append(
+                _probe_endpoint(api_key, "https://api.apifree.ai/agent/v1", alt_model)
+            )
+        _agent_dbg(
+            "A,B,D,E",
+            "generate_script.py:call_openai:schema_probe",
+            "probed alternate endpoints/models after exhausting fallbacks",
+            {"probes": probes, "tried": tried, "last_err_msg": err_msg},
+        )
     # #endregion
 
-    # APIFree sometimes returns HTTP 200 with an error payload.
-    if isinstance(data, dict) and (
-        data.get("error")
-        or (isinstance(data.get("code"), int) and int(data["code"]) >= 400)
-    ):
-        # #region agent log
-        err_msg = ""
-        if isinstance(data.get("error"), dict):
-            err_msg = str(data["error"].get("message") or "")
-        if "model schema not found" in err_msg.lower() or data.get("code") == 500:
-            candidates = [
-                "https://api.apifree.ai/agent/v1",
-                "https://api.apifree.ai/v1",
-            ]
-            # Also try alternate model id spellings against the primary base.
-            model_alts = [
-                model,
-                "skywork-ai/skyclaw-v1",
-                "skywork-ai/skyclaw-v1-lite",
-                "skyclaw-v1-lite",
-                "skyclaw-v1",
-            ]
-            probes = []
-            for candidate in candidates:
-                probes.append(_list_models(api_key, candidate))
-                probes.append(_probe_endpoint(api_key, candidate, model))
-            for alt_model in model_alts:
-                if alt_model == model:
-                    continue
-                probes.append(_probe_endpoint(api_key, base_url, alt_model))
-                probes.append(
-                    _probe_endpoint(api_key, "https://api.apifree.ai/agent/v1", alt_model)
-                )
-            _agent_dbg(
-                "A,B,D,E",
-                "generate_script.py:call_openai:schema_probe",
-                "probed alternate endpoints/models after schema error",
-                {"probes": probes},
-            )
-        # #endregion
-        raise RuntimeError(
-            f"API error (HTTP {response.status_code}, model={model}): {data}"
-        )
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"API error {response.status_code} (model={model}): {response.text[:1000]}"
-        )
-
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(
-            f"Unexpected API response (model={model}): {data}"
-        ) from exc
-
-    if not content or not str(content).strip():
-        raise RuntimeError("API returned empty script content")
-    return str(content).strip()
+    raise RuntimeError(
+        f"API error (HTTP {last_status}, model={model}, base_url={base_url}): "
+        f"{last_error!r}. Tried configs: {tried}"
+    )
 
 
 def normalize_script(text: str) -> str:

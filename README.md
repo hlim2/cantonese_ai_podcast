@@ -20,6 +20,8 @@ to APIFree SkyClaw:
 | OPENAI_MODEL    | skywork-ai/skyclaw-v1 or ...-lite |
 | OPENAI_API_KEY  | APIFree key                       |
 
+If GitHub **Variables** point at a model that APIFree does not host (for example `qwen/qwen3-32b` on `https://api.apifree.ai/v1`), `generate_script.py` automatically retries SkyClaw on the `/agent/v1` endpoint before failing.
+
 Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 
 **3. Synthesize audio**
@@ -28,6 +30,10 @@ scripts/synthesize_podcast.py:
 parses each dialogue line
 speaks them with **edge-tts** (阿希=zh-HK-HiuMaanNeural, 阿明=zh-HK-WanLungNeural)
 merges with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
+
+Uses Microsoft’s current Edge TTS host (`api.msedgeservices.com`) by default; if that
+handshake returns 403 it falls back to the legacy `speech.platform.bing.com` URL.
+Override with env `EDGE_TTS_WSS_URL` if needed.
 
 **4. Deliver to Telegram**
 curl sendDocument uploads:
