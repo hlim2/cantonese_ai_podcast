@@ -20,6 +20,8 @@ to APIFree SkyClaw:
 | OPENAI_MODEL    | skywork-ai/skyclaw-v1 or ...-lite |
 | OPENAI_API_KEY  | APIFree key                       |
 
+If GitHub **Variables** point at a model that APIFree does not host (for example `qwen/qwen3-32b` on `https://api.apifree.ai/v1`), `generate_script.py` automatically retries SkyClaw on the `/agent/v1` endpoint before failing.
+
 Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 
 **3. Synthesize audio**
