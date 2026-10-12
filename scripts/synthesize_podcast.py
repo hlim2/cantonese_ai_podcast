@@ -17,12 +17,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import edge_tts
+import edge_tts.communicate as edge_communicate
+from aiohttp import ClientResponseError
+from edge_tts.constants import TRUSTED_CLIENT_TOKEN, WSS_URL as LEGACY_WSS_URL
 from edge_tts.exceptions import NoAudioReceived
 
 SPEAKER_VOICES = {
     "阿希": os.getenv("VOICE_AH_HEI", "zh-HK-HiuMaanNeural"),
     "阿明": os.getenv("VOICE_AH_MING", "zh-HK-WanLungNeural"),
 }
+
+# Microsoft moved Edge Read Aloud synthesis off speech.platform.bing.com (403
+# worldwide as of 2026-10-12). The Edge 155 host still accepts the legacy
+# Sec-MS-GEC token when passed as Ocp-Apim-Subscription-Key. See edge-tts#490.
+NEW_WSS_URL = (
+    "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+    f"?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}"
+)
+TTS_WSS_URLS = (
+    os.getenv("EDGE_TTS_WSS_URL", "").strip() or NEW_WSS_URL,
+    LEGACY_WSS_URL,
+)
 
 # Slightly slower / warmer pacing for less mechanical delivery.
 TTS_RATE = os.getenv("TTS_RATE", "-8%")
@@ -81,6 +96,16 @@ def sanitize_tts_text(text: str) -> str:
     return cleaned
 
 
+def _wss_host(url: str) -> str:
+    return url.split("?", 1)[0]
+
+
+def configure_edge_tts_endpoint(url: str) -> None:
+    """Point edge-tts at a synthesis WebSocket URL (module-global used by Communicate)."""
+    edge_communicate.WSS_URL = url
+    log(f"edge-tts WSS endpoint={_wss_host(url)}")
+
+
 async def synthesize_line(text: str, voice: str, output_path: Path) -> None:
     communicate = edge_tts.Communicate(
         text,
@@ -89,6 +114,13 @@ async def synthesize_line(text: str, voice: str, output_path: Path) -> None:
         pitch=TTS_PITCH,
     )
     await communicate.save(str(output_path))
+
+
+def _is_tts_handshake_403(exc: BaseException) -> bool:
+    if isinstance(exc, ClientResponseError) and getattr(exc, "status", None) == 403:
+        return True
+    text = str(exc)
+    return "403" in text and ("Invalid response status" in text or "WSServerHandshakeError" in type(exc).__name__)
 
 
 async def synthesize_line_with_retry(
@@ -116,6 +148,7 @@ async def synthesize_line_with_retry(
             "changed": text != content,
             "preview": text[:80],
             "has_url": "http://" in content.lower() or "https://" in content.lower(),
+            "wss_host": _wss_host(edge_communicate.WSS_URL),
         },
     )
     # #endregion
@@ -123,6 +156,7 @@ async def synthesize_line_with_retry(
         raise RuntimeError(f"Line {idx} is empty after sanitization")
 
     last_error: Exception | None = None
+    endpoint_index = 0
     for attempt in range(1, max_attempts + 1):
         try:
             await synthesize_line(text, voice, output_path)
@@ -132,7 +166,11 @@ async def synthesize_line_with_retry(
                     "TTS-B",
                     "synthesize_podcast.py:line:retry_ok",
                     "retry succeeded",
-                    {"idx": idx, "attempt": attempt},
+                    {
+                        "idx": idx,
+                        "attempt": attempt,
+                        "wss_host": _wss_host(edge_communicate.WSS_URL),
+                    },
                 )
                 # #endregion
             return
@@ -168,9 +206,32 @@ async def synthesize_line_with_retry(
                     "exc_type": type(exc).__name__,
                     "exc": str(exc)[:200],
                     "preview": text[:120],
+                    "wss_host": _wss_host(edge_communicate.WSS_URL),
+                    "is_403": _is_tts_handshake_403(exc),
                 },
             )
             # #endregion
+            if _is_tts_handshake_403(exc) and endpoint_index + 1 < len(TTS_WSS_URLS):
+                endpoint_index += 1
+                next_url = TTS_WSS_URLS[endpoint_index]
+                log(
+                    "edge-tts handshake 403; failing over to "
+                    f"{_wss_host(next_url)}"
+                )
+                configure_edge_tts_endpoint(next_url)
+                # #region agent log
+                _agent_dbg(
+                    "TTS-F",
+                    "synthesize_podcast.py:line:failover",
+                    "switched TTS websocket host after 403",
+                    {
+                        "idx": idx,
+                        "attempt": attempt,
+                        "wss_host": _wss_host(next_url),
+                    },
+                )
+                # #endregion
+                continue
             if attempt < max_attempts:
                 await asyncio.sleep(1.5 * attempt)
 
@@ -219,12 +280,17 @@ async def build_podcast(script_path: Path, output_mp3: Path) -> None:
         )
 
     log(f"Synthesizing {len(dialogue)} dialogue lines")
+    configure_edge_tts_endpoint(TTS_WSS_URLS[0])
     # #region agent log
     _agent_dbg(
         "TTS-A",
         "synthesize_podcast.py:build:start",
         "dialogue parsed",
-        {"line_count": len(dialogue), "voices": SPEAKER_VOICES},
+        {
+            "line_count": len(dialogue),
+            "voices": SPEAKER_VOICES,
+            "wss_hosts": [_wss_host(u) for u in TTS_WSS_URLS],
+        },
     )
     # #endregion
     with tempfile.TemporaryDirectory(prefix="podcast-tts-") as tmp:

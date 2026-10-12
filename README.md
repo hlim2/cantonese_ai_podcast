@@ -31,6 +31,10 @@ parses each dialogue line
 speaks them with **edge-tts** (阿希=zh-HK-HiuMaanNeural, 阿明=zh-HK-WanLungNeural)
 merges with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
 
+Uses Microsoft’s current Edge TTS host (`api.msedgeservices.com`) by default; if that
+handshake returns 403 it falls back to the legacy `speech.platform.bing.com` URL.
+Override with env `EDGE_TTS_WSS_URL` if needed.
+
 **4. Deliver to Telegram**
 curl sendDocument uploads:
 
