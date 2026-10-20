@@ -7,11 +7,25 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
+
+# Transient gateway / proxy failures that should trigger retry + alternate configs.
+_GATEWAY_ERROR_MARKERS = (
+    "no healthy upstream",
+    "upstream connect error",
+    "connection refused",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "503 service",
+    "502 bad",
+    "504 gateway",
+)
 
 SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 請用香港粵語口語（書面可以夾雜粵語詞），寫一段雙主持對話稿。
@@ -46,8 +60,6 @@ def log(message: str) -> None:
 # #region agent log
 def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
     """Safe NDJSON debug to stderr + local file. Never logs secrets."""
-    import time
-
     payload = {
         "sessionId": "840db8",
         "runId": os.getenv("GITHUB_RUN_ID", "local"),
@@ -185,10 +197,17 @@ def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     return unique
 
 
+def _looks_like_gateway_error(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _GATEWAY_ERROR_MARKERS)
+
+
 def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
     """True when retrying another apifree model/base URL may succeed."""
     if not isinstance(data, dict):
         return False
+    if data.get("_non_json") or data.get("_transport_error"):
+        return True
     if isinstance(data.get("code"), int) and int(data["code"]) >= 400:
         return True
     err = data.get("error")
@@ -196,15 +215,75 @@ def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
         return False
     code = str(err.get("code") or "").lower()
     msg = str(err.get("message") or "").lower()
-    if code in ("model_not_found", "model_schema_not_found"):
+    if code in (
+        "model_not_found",
+        "model_schema_not_found",
+        "upstream_error",
+        "server_error",
+        "timeout",
+    ):
         return True
     if "model schema not found" in msg or "model not exist" in msg:
+        return True
+    if _looks_like_gateway_error(msg):
         return True
     return False
 
 
+def _is_skyclaw_model(model: str) -> bool:
+    lowered = (model or "").lower()
+    return "skyclaw" in lowered or "skywork" in lowered
+
+
+def _general_chat_models() -> list[str]:
+    """Models that live on the general APIFree /v1 gateway (not SkyClaw agent)."""
+    env_extra = [
+        part.strip()
+        for part in (os.getenv("OPENAI_FALLBACK_MODELS") or "").split(",")
+        if part.strip() and not _is_skyclaw_model(part)
+    ]
+    defaults = [
+        "qwen/qwen3-32b",
+        "qwen/qwen3-8b",
+        "deepseek-chat",
+        "gpt-4o-mini",
+    ]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for mid in [*env_extra, *defaults]:
+        if mid in seen:
+            continue
+        seen.add(mid)
+        ordered.append(mid)
+    return ordered
+
+
+def _skyclaw_model_ids(primary_model: str) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for mid in (
+        primary_model,
+        "skywork-ai/skyclaw-v1-lite",
+        "skywork-ai/skyclaw-v1",
+        "skyclaw-v1-lite",
+        "skyclaw-v1",
+    ):
+        if not _is_skyclaw_model(mid) or mid in seen:
+            continue
+        seen.add(mid)
+        ordered.append(mid)
+    return ordered
+
+
 def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]]:
-    """Ordered (base_url, model) pairs to try after the primary config fails."""
+    """Ordered (base_url, model) pairs after the primary config fails.
+
+    Runtime evidence (GitHub Actions 39400124359):
+    - /v1 + skywork-ai/skyclaw-v1-lite → JSON error "model schema not found"
+    - /agent/v1 + skywork-ai/skyclaw-v1-lite → non-JSON "no healthy upstream"
+    So after SkyClaw fails, prefer general /v1 chat models (Qwen/etc.) before
+    burning more SkyClaw aliases on the wrong gateway.
+    """
     seen: set[tuple[str, str]] = set()
     ordered: list[tuple[str, str]] = []
 
@@ -218,18 +297,71 @@ def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]
     add(base_url, model)
     if "apifree.ai" not in base_url.lower():
         return ordered
-    for url in (
-        "https://api.apifree.ai/agent/v1",
-        "https://api.apifree.ai/v1",
-    ):
-        for mid in (
-            "skywork-ai/skyclaw-v1-lite",
-            "skywork-ai/skyclaw-v1",
-            "skyclaw-v1-lite",
-            "skyclaw-v1",
-        ):
-            add(url, mid)
+
+    general_v1 = "https://api.apifree.ai/v1"
+    agent_v1 = "https://api.apifree.ai/agent/v1"
+    general_models = _general_chat_models()
+    skyclaw_models = _skyclaw_model_ids(model)
+
+    # 1) General chat models on /v1 (works when SkyClaw schema is missing there).
+    for mid in general_models:
+        add(general_v1, mid)
+
+    # 2) SkyClaw only on the agent endpoint (where the schema exists when healthy).
+    for mid in skyclaw_models:
+        add(agent_v1, mid)
+
+    # 3) Also try the configured base with general models (if it wasn't /v1).
+    for mid in general_models:
+        add(base_url, mid)
+
+    # 4) Last: SkyClaw aliases on /v1 in case APIFree restores that schema.
+    for mid in skyclaw_models:
+        add(general_v1, mid)
+
     return ordered
+
+
+def build_offline_script(news_items: list[dict[str, str]], date_label: str) -> str:
+    """Deterministic 阿希/阿明 script when every LLM endpoint is unreachable."""
+    items = news_items[:5] or [
+        {
+            "source": "AI 日報",
+            "title": "今日未能即時取得外部新聞來源",
+            "link": "",
+        }
+    ]
+    lines: list[str] = [
+        "阿希: 各位早晨，歡迎收聽今日嘅 AI 日報。我係阿希。",
+        f"阿明: 早晨阿希，今日係 {date_label}，我準備好聽下最近有咩 AI 動態。",
+        "阿希: 好，我哋會用比較口語嘅方式，帶大家睇幾則重點。",
+        "阿明: 得，你開波啦。",
+    ]
+    for idx, item in enumerate(items, start=1):
+        title = (item.get("title") or "未命名新聞").strip()
+        source = (item.get("source") or "來源不詳").strip()
+        link = (item.get("link") or "").strip()
+        lines.extend(
+            [
+                f"阿希: 第{idx}則來自 {source}：{title}",
+                "阿明: 吓，咁係講緊咩嚟㗎？用淺白啲講得唔得？",
+                f"阿希: 簡單講，就係業界同公眾而家好關注呢單發展，標題已經交代咗核心事件。",
+                "阿明: 即係聽眾記住標題同來源，已經有個底？",
+                "阿希: 係呀。如果想跟進細節，可以之後自己睇原文。",
+                "阿明: 咁我嘅 takeaway 就係：留意事件本身，唔好被標題嚇窒。",
+            ]
+        )
+        if link:
+            lines.append(f"阿希: 原文連結係：{link}")
+            lines.append("阿明: 收到，我稍後會再睇。")
+    lines.extend(
+        [
+            "阿希: 今日就講到呢度。記住，以上係根據標題同來源整理嘅簡報版。",
+            "阿明: 多謝阿希。各位聽眾，我哋聽日再見。",
+            "阿希: 拜拜。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _chat_completion(
@@ -237,36 +369,60 @@ def _chat_completion(
     model: str,
     base_url: str,
     user_prompt: str,
-) -> tuple[requests.Response, dict[str, Any]]:
+) -> tuple[requests.Response | None, dict[str, Any]]:
+    """POST chat/completions. Gateway/non-JSON failures return a synthetic error dict."""
     url = base_url.rstrip("/") + "/chat/completions"
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "temperature": 0.7,
-            # Required by APIFree for Qwen3; harmless for other chat models.
-            "enable_thinking": False,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
-        timeout=180,
-    )
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0.7,
+                # Required by APIFree for Qwen3; harmless for other chat models.
+                "enable_thinking": False,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+            timeout=180,
+        )
+    except requests.RequestException as exc:
+        return None, {
+            "_transport_error": True,
+            "code": 503,
+            "error": {
+                "code": "upstream_error",
+                "message": f"{type(exc).__name__}: {exc}"[:500],
+            },
+        }
+
     try:
         data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"API returned non-JSON (HTTP {response.status_code}): {response.text[:1000]}"
-        ) from exc
+    except ValueError:
+        body = (response.text or "").strip()
+        return response, {
+            "_non_json": True,
+            "code": response.status_code if response.status_code >= 400 else 503,
+            "error": {
+                "code": "upstream_error",
+                "message": body[:500] or f"empty non-JSON body (HTTP {response.status_code})",
+            },
+            "raw_prefix": body[:120],
+        }
     if not isinstance(data, dict):
-        raise RuntimeError(
-            f"Unexpected API response type (model={model}): {data!r}"
-        )
+        return response, {
+            "_non_json": True,
+            "code": 502,
+            "error": {
+                "code": "upstream_error",
+                "message": f"Unexpected API response type: {type(data).__name__}",
+            },
+        }
     return response, data
 
 
@@ -292,10 +448,15 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
     last_error: dict[str, Any] | None = None
     last_status = 0
     tried: list[dict[str, str]] = []
+    # Per-config transient retries for gateway/upstream blips before switching config.
+    max_transient_retries = 2
+    # After repeated gateway failures on a base+model, skip further sleeps on that base.
+    gateway_hits_by_base: dict[str, int] = {}
 
     for attempt_base, attempt_model in _apifree_fallback_configs(model, base_url):
-        url = attempt_base.rstrip("/") + "/chat/completions"
-        is_primary = attempt_base.rstrip("/") == base_url.rstrip("/") and attempt_model == model
+        normalized_base = attempt_base.rstrip("/")
+        url = normalized_base + "/chat/completions"
+        is_primary = normalized_base == base_url.rstrip("/") and attempt_model == model
         if is_primary:
             log(f"LLM endpoint={attempt_base} model={attempt_model}")
         else:
@@ -305,83 +466,150 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
             )
         tried.append({"base_url": attempt_base, "model": attempt_model})
 
-        # #region agent log
-        _agent_dbg(
-            "A,B",
-            "generate_script.py:call_openai:pre",
-            "request metadata",
-            {
-                "url": url,
-                "base_url": attempt_base,
-                "model": attempt_model,
-                "base_has_agent": "/agent" in attempt_base,
-                "prompt_chars": len(user_prompt),
-                "key_present": bool(api_key),
-                "key_length": len(api_key),
-                "is_primary": is_primary,
-            },
-        )
-        # #endregion
-
-        response, data = _chat_completion(
-            api_key, attempt_model, attempt_base, user_prompt
-        )
-
-        # #region agent log
-        err = data.get("error")
-        _agent_dbg(
-            "A,B,C",
-            "generate_script.py:call_openai:post",
-            "response metadata",
-            {
-                "http_status": response.status_code,
-                "has_choices": "choices" in data,
-                "body_code": data.get("code"),
-                "error_code": err.get("code") if isinstance(err, dict) else None,
-                "error_message": err.get("message") if isinstance(err, dict) else None,
-                "served_by": data.get("served_by"),
-                "top_keys": sorted(data.keys()),
-                "model": attempt_model,
-                "base_url": attempt_base,
-            },
-        )
-        # #endregion
-
-        if response.status_code >= 400:
-            last_error = data
-            last_status = response.status_code
-            continue
-
-        if data.get("error") or (
-            isinstance(data.get("code"), int) and int(data["code"]) >= 400
-        ):
-            last_error = data
-            last_status = response.status_code
-            if _is_recoverable_apifree_error(data):
-                continue
-            break
-
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            last_error = data
-            last_status = response.status_code
-            if _is_recoverable_apifree_error(data):
-                continue
-            raise RuntimeError(
-                f"Unexpected API response (model={attempt_model}): {data}"
-            ) from exc
-
-        if not content or not str(content).strip():
-            last_error = {"error": {"message": "empty content"}}
-            last_status = response.status_code
-            continue
-
-        if not is_primary:
-            log(
-                f"Recovered using fallback LLM config: {attempt_base} / {attempt_model}"
+        move_to_next_config = False
+        for transient_idx in range(max_transient_retries):
+            # #region agent log
+            _agent_dbg(
+                "A,B",
+                "generate_script.py:call_openai:pre",
+                "request metadata",
+                {
+                    "url": url,
+                    "base_url": attempt_base,
+                    "model": attempt_model,
+                    "base_has_agent": "/agent" in attempt_base,
+                    "prompt_chars": len(user_prompt),
+                    "key_present": bool(api_key),
+                    "key_length": len(api_key),
+                    "is_primary": is_primary,
+                    "transient_attempt": transient_idx + 1,
+                },
             )
-        return str(content).strip()
+            # #endregion
+
+            response, data = _chat_completion(
+                api_key, attempt_model, attempt_base, user_prompt
+            )
+            http_status = (
+                response.status_code
+                if response is not None
+                else int(data.get("code") or 503)
+            )
+
+            # #region agent log
+            err = data.get("error")
+            _agent_dbg(
+                "A,B,C",
+                "generate_script.py:call_openai:post",
+                "response metadata",
+                {
+                    "http_status": http_status,
+                    "has_choices": "choices" in data,
+                    "body_code": data.get("code"),
+                    "error_code": err.get("code") if isinstance(err, dict) else None,
+                    "error_message": (
+                        err.get("message") if isinstance(err, dict) else None
+                    ),
+                    "served_by": data.get("served_by"),
+                    "top_keys": sorted(data.keys()),
+                    "model": attempt_model,
+                    "base_url": attempt_base,
+                    "non_json": bool(data.get("_non_json")),
+                    "transport_error": bool(data.get("_transport_error")),
+                    "transient_attempt": transient_idx + 1,
+                },
+            )
+            # #endregion
+
+            if http_status >= 400 or data.get("_non_json") or data.get("_transport_error"):
+                last_error = data
+                last_status = http_status
+                err_msg = ""
+                if isinstance(err, dict):
+                    err_msg = str(err.get("message") or "")
+                is_gateway = bool(
+                    data.get("_non_json")
+                    or data.get("_transport_error")
+                    or _looks_like_gateway_error(err_msg)
+                    or http_status in (502, 503, 504)
+                )
+                if is_gateway:
+                    gateway_hits_by_base[normalized_base] = (
+                        gateway_hits_by_base.get(normalized_base, 0) + 1
+                    )
+                # Only sleep/retry the first gateway hit per base; other models may
+                # still work on the same gateway (SkyClaw upstream vs general /v1).
+                if (
+                    is_gateway
+                    and transient_idx + 1 < max_transient_retries
+                    and gateway_hits_by_base.get(normalized_base, 0) <= 1
+                ):
+                    sleep_s = 2 ** transient_idx
+                    log(
+                        f"Transient upstream/gateway error "
+                        f"(HTTP {http_status}): "
+                        f"{err_msg[:120] or data.get('raw_prefix', '')!r}; "
+                        f"sleeping {sleep_s}s then retrying same config"
+                    )
+                    # #region agent log
+                    _agent_dbg(
+                        "C",
+                        "generate_script.py:call_openai:transient_retry",
+                        "sleeping before same-config retry",
+                        {
+                            "sleep_s": sleep_s,
+                            "http_status": http_status,
+                            "err_msg": err_msg[:160],
+                            "base_url": attempt_base,
+                            "model": attempt_model,
+                        },
+                    )
+                    # #endregion
+                    time.sleep(sleep_s)
+                    continue
+                move_to_next_config = True
+                break
+
+            if data.get("error") or (
+                isinstance(data.get("code"), int) and int(data["code"]) >= 400
+            ):
+                last_error = data
+                last_status = http_status
+                if _is_recoverable_apifree_error(data):
+                    move_to_next_config = True
+                    break
+                raise RuntimeError(
+                    f"API error (HTTP {last_status}, model={attempt_model}, "
+                    f"base_url={attempt_base}): {last_error!r}"
+                )
+
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                last_error = data
+                last_status = http_status
+                if _is_recoverable_apifree_error(data):
+                    move_to_next_config = True
+                    break
+                raise RuntimeError(
+                    f"Unexpected API response (model={attempt_model}): {data}"
+                ) from exc
+
+            if not content or not str(content).strip():
+                last_error = {"error": {"message": "empty content"}}
+                last_status = http_status
+                move_to_next_config = True
+                break
+
+            if not is_primary or transient_idx > 0:
+                log(
+                    f"Recovered using LLM config: {attempt_base} / {attempt_model} "
+                    f"(transient_attempt={transient_idx + 1})"
+                )
+            return str(content).strip()
+
+        if move_to_next_config:
+            continue
 
     # #region agent log
     err_msg = ""
@@ -440,17 +668,24 @@ def main() -> None:
     parser.add_argument("--output", default="podcast_script.md")
     parser.add_argument(
         "--model",
-        default=os.getenv("OPENAI_MODEL", "skywork-ai/skyclaw-v1-lite"),
+        # SkyClaw on /v1 returns "model schema not found"; default to a general /v1 model.
+        default=os.getenv("OPENAI_MODEL", "qwen/qwen3-32b"),
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/agent/v1"),
+        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/v1"),
+    )
+    parser.add_argument(
+        "--require-llm",
+        action="store_true",
+        default=os.getenv("REQUIRE_LLM", "").strip().lower() in ("1", "true", "yes"),
+        help="Fail if the LLM is unreachable instead of writing an offline script",
     )
     args = parser.parse_args()
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY is required")
+    if not api_key and args.require_llm:
+        raise SystemExit("OPENAI_API_KEY is required when --require-llm is set")
 
     news_path = Path(args.news)
     if not news_path.exists():
@@ -461,12 +696,46 @@ def main() -> None:
     date_label = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log(f"Using {len(news_items)} news items for script generation")
 
-    script = call_openai(
-        api_key=api_key,
-        model=args.model,
-        base_url=args.base_url,
-        user_prompt=build_user_prompt(news_items, date_label),
-    )
+    script: str | None = None
+    if api_key:
+        try:
+            script = call_openai(
+                api_key=api_key,
+                model=args.model,
+                base_url=args.base_url,
+                user_prompt=build_user_prompt(news_items, date_label),
+            )
+        except RuntimeError as exc:
+            # #region agent log
+            _agent_dbg(
+                "F",
+                "generate_script.py:main:llm_failed",
+                "LLM exhausted; considering offline fallback",
+                {
+                    "require_llm": bool(args.require_llm),
+                    "error_prefix": str(exc)[:240],
+                },
+            )
+            # #endregion
+            if args.require_llm:
+                raise
+            log(f"LLM unavailable ({exc}); using offline script fallback")
+    elif args.require_llm:
+        raise SystemExit("OPENAI_API_KEY is required")
+    else:
+        log("OPENAI_API_KEY missing; using offline script fallback")
+
+    if script is None:
+        script = build_offline_script(news_items, date_label)
+        # #region agent log
+        _agent_dbg(
+            "F",
+            "generate_script.py:main:offline_script",
+            "wrote deterministic offline dialogue",
+            {"chars": len(script), "news_count": len(news_items)},
+        )
+        # #endregion
+
     script = normalize_script(script)
 
     output_path = Path(args.output)

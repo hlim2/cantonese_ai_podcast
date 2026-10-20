@@ -16,11 +16,21 @@ to APIFree SkyClaw:
 
 | Setting         | Typical value                     |
 |-----------------|-----------------------------------|
-| OPENAI_BASE_URL | https://api.apifree.ai/agent/v1   |
-| OPENAI_MODEL    | skywork-ai/skyclaw-v1 or ...-lite |
+| OPENAI_BASE_URL | https://api.apifree.ai/v1         |
+| OPENAI_MODEL    | qwen/qwen3-32b (recommended)      |
 | OPENAI_API_KEY  | APIFree key                       |
 
-If GitHub **Variables** point at a model that APIFree does not host (for example `qwen/qwen3-32b` on `https://api.apifree.ai/v1`), `generate_script.py` automatically retries SkyClaw on the `/agent/v1` endpoint before failing.
+**Important (from CI run 39400124359):**
+- `https://api.apifree.ai/v1` + `skywork-ai/skyclaw-v1-lite` → `model schema not found`
+- `https://api.apifree.ai/agent/v1` + SkyClaw → `no healthy upstream` when that upstream is down
+
+So do **not** point Variables at `/v1` + SkyClaw. Either use `/v1` + `qwen/qwen3-32b`, or `/agent/v1` + SkyClaw when the agent upstream is healthy.
+
+`generate_script.py` recovers in layers:
+
+1. Retry once on gateway text like HTTP 200 `no healthy upstream`
+2. Prefer general `/v1` models (`qwen/qwen3-32b`, …), then SkyClaw on `/agent/v1`. Override extras with `OPENAI_FALLBACK_MODELS`
+3. If every LLM call still fails, write a deterministic offline 阿希/阿明 script from `news.json` so TTS + Telegram still run. Set `REQUIRE_LLM=true` to keep fail-hard behavior.
 
 Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 
