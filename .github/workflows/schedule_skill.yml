@@ -35,10 +35,11 @@ jobs:
         env:
           # APIFree / SkyClaw defaults. Override with repo Variables if needed.
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'skywork-ai/skyclaw-v1-lite' }}
-          # Official SkyClaw docs use /v1; script also retries /agent/v1 and other models.
+          # SkyClaw is only on /agent/v1. /v1 returns "model schema not found" for it.
+          # Prefer a general /v1 chat model so daily runs survive SkyClaw outages.
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'qwen/qwen3-32b' }}
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.apifree.ai/v1' }}
-          # Optional comma-separated extras, e.g. qwen/qwen3-32b,deepseek-chat
+          # Optional comma-separated extras, e.g. deepseek-chat,gpt-4o-mini
           OPENAI_FALLBACK_MODELS: ${{ vars.OPENAI_FALLBACK_MODELS || '' }}
           # Set repo var REQUIRE_LLM=true to fail the job instead of offline script.
           REQUIRE_LLM: ${{ vars.REQUIRE_LLM || '' }}

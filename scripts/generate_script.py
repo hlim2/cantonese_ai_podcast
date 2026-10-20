@@ -230,19 +230,19 @@ def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
     return False
 
 
-def _fallback_model_ids(primary_model: str) -> list[str]:
-    """Primary model plus env/extra SkyClaw and general chat models."""
+def _is_skyclaw_model(model: str) -> bool:
+    lowered = (model or "").lower()
+    return "skyclaw" in lowered or "skywork" in lowered
+
+
+def _general_chat_models() -> list[str]:
+    """Models that live on the general APIFree /v1 gateway (not SkyClaw agent)."""
     env_extra = [
         part.strip()
         for part in (os.getenv("OPENAI_FALLBACK_MODELS") or "").split(",")
-        if part.strip()
+        if part.strip() and not _is_skyclaw_model(part)
     ]
     defaults = [
-        "skywork-ai/skyclaw-v1-lite",
-        "skywork-ai/skyclaw-v1",
-        "skyclaw-v1-lite",
-        "skyclaw-v1",
-        # Non-SkyClaw options on the general /v1 gateway when agent/SkyClaw is down.
         "qwen/qwen3-32b",
         "qwen/qwen3-8b",
         "deepseek-chat",
@@ -250,7 +250,7 @@ def _fallback_model_ids(primary_model: str) -> list[str]:
     ]
     ordered: list[str] = []
     seen: set[str] = set()
-    for mid in [primary_model, *env_extra, *defaults]:
+    for mid in [*env_extra, *defaults]:
         if mid in seen:
             continue
         seen.add(mid)
@@ -258,8 +258,32 @@ def _fallback_model_ids(primary_model: str) -> list[str]:
     return ordered
 
 
+def _skyclaw_model_ids(primary_model: str) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for mid in (
+        primary_model,
+        "skywork-ai/skyclaw-v1-lite",
+        "skywork-ai/skyclaw-v1",
+        "skyclaw-v1-lite",
+        "skyclaw-v1",
+    ):
+        if not _is_skyclaw_model(mid) or mid in seen:
+            continue
+        seen.add(mid)
+        ordered.append(mid)
+    return ordered
+
+
 def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]]:
-    """Ordered (base_url, model) pairs to try after the primary config fails."""
+    """Ordered (base_url, model) pairs after the primary config fails.
+
+    Runtime evidence (GitHub Actions 39400124359):
+    - /v1 + skywork-ai/skyclaw-v1-lite → JSON error "model schema not found"
+    - /agent/v1 + skywork-ai/skyclaw-v1-lite → non-JSON "no healthy upstream"
+    So after SkyClaw fails, prefer general /v1 chat models (Qwen/etc.) before
+    burning more SkyClaw aliases on the wrong gateway.
+    """
     seen: set[tuple[str, str]] = set()
     ordered: list[tuple[str, str]] = []
 
@@ -274,16 +298,27 @@ def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]
     if "apifree.ai" not in base_url.lower():
         return ordered
 
-    # Prefer /v1 (current SkyClaw docs) then /agent/v1; configured base already first.
-    bases = [
-        base_url,
-        "https://api.apifree.ai/v1",
-        "https://api.apifree.ai/agent/v1",
-    ]
-    models = _fallback_model_ids(model)
-    for url in bases:
-        for mid in models:
-            add(url, mid)
+    general_v1 = "https://api.apifree.ai/v1"
+    agent_v1 = "https://api.apifree.ai/agent/v1"
+    general_models = _general_chat_models()
+    skyclaw_models = _skyclaw_model_ids(model)
+
+    # 1) General chat models on /v1 (works when SkyClaw schema is missing there).
+    for mid in general_models:
+        add(general_v1, mid)
+
+    # 2) SkyClaw only on the agent endpoint (where the schema exists when healthy).
+    for mid in skyclaw_models:
+        add(agent_v1, mid)
+
+    # 3) Also try the configured base with general models (if it wasn't /v1).
+    for mid in general_models:
+        add(base_url, mid)
+
+    # 4) Last: SkyClaw aliases on /v1 in case APIFree restores that schema.
+    for mid in skyclaw_models:
+        add(general_v1, mid)
+
     return ordered
 
 
@@ -633,11 +668,11 @@ def main() -> None:
     parser.add_argument("--output", default="podcast_script.md")
     parser.add_argument(
         "--model",
-        default=os.getenv("OPENAI_MODEL", "skywork-ai/skyclaw-v1-lite"),
+        # SkyClaw on /v1 returns "model schema not found"; default to a general /v1 model.
+        default=os.getenv("OPENAI_MODEL", "qwen/qwen3-32b"),
     )
     parser.add_argument(
         "--base-url",
-        # Official SkyClaw docs currently show /v1; /agent/v1 remains in the fallback list.
         default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/v1"),
     )
     parser.add_argument(
