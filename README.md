@@ -16,13 +16,15 @@ to APIFree SkyClaw:
 
 | Setting         | Typical value                     |
 |-----------------|-----------------------------------|
-| OPENAI_BASE_URL | https://api.apifree.ai/agent/v1   |
+| OPENAI_BASE_URL | https://api.apifree.ai/v1         |
 | OPENAI_MODEL    | skywork-ai/skyclaw-v1 or ...-lite |
 | OPENAI_API_KEY  | APIFree key                       |
 
-If GitHub **Variables** point at a model that APIFree does not host (for example `qwen/qwen3-32b` on `https://api.apifree.ai/v1`), `generate_script.py` automatically retries SkyClaw on the `/agent/v1` endpoint before failing.
+`generate_script.py` recovers from APIFree outages in layers:
 
-It also treats gateway blips such as HTTP 200 with body `no healthy upstream` as recoverable: a short same-config retry, then the other base URL (`/agent/v1` ↔ `/v1`) and alternate SkyClaw model ids.
+1. Retry the same config once on gateway text like HTTP 200 `no healthy upstream`
+2. Try alternate bases (`/v1` and `/agent/v1`) and models (SkyClaw ids, then `qwen/qwen3-32b`, `deepseek-chat`, …). Override extras with repo variable `OPENAI_FALLBACK_MODELS`
+3. If every LLM call still fails, write a deterministic offline 阿希/阿明 script from `news.json` so TTS + Telegram still run. Set `REQUIRE_LLM=true` to keep the old fail-hard behavior.
 
 Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 

@@ -230,6 +230,34 @@ def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
     return False
 
 
+def _fallback_model_ids(primary_model: str) -> list[str]:
+    """Primary model plus env/extra SkyClaw and general chat models."""
+    env_extra = [
+        part.strip()
+        for part in (os.getenv("OPENAI_FALLBACK_MODELS") or "").split(",")
+        if part.strip()
+    ]
+    defaults = [
+        "skywork-ai/skyclaw-v1-lite",
+        "skywork-ai/skyclaw-v1",
+        "skyclaw-v1-lite",
+        "skyclaw-v1",
+        # Non-SkyClaw options on the general /v1 gateway when agent/SkyClaw is down.
+        "qwen/qwen3-32b",
+        "qwen/qwen3-8b",
+        "deepseek-chat",
+        "gpt-4o-mini",
+    ]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for mid in [primary_model, *env_extra, *defaults]:
+        if mid in seen:
+            continue
+        seen.add(mid)
+        ordered.append(mid)
+    return ordered
+
+
 def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]]:
     """Ordered (base_url, model) pairs to try after the primary config fails."""
     seen: set[tuple[str, str]] = set()
@@ -245,18 +273,60 @@ def _apifree_fallback_configs(model: str, base_url: str) -> list[tuple[str, str]
     add(base_url, model)
     if "apifree.ai" not in base_url.lower():
         return ordered
-    for url in (
-        "https://api.apifree.ai/agent/v1",
+
+    # Prefer /v1 (current SkyClaw docs) then /agent/v1; configured base already first.
+    bases = [
+        base_url,
         "https://api.apifree.ai/v1",
-    ):
-        for mid in (
-            "skywork-ai/skyclaw-v1-lite",
-            "skywork-ai/skyclaw-v1",
-            "skyclaw-v1-lite",
-            "skyclaw-v1",
-        ):
+        "https://api.apifree.ai/agent/v1",
+    ]
+    models = _fallback_model_ids(model)
+    for url in bases:
+        for mid in models:
             add(url, mid)
     return ordered
+
+
+def build_offline_script(news_items: list[dict[str, str]], date_label: str) -> str:
+    """Deterministic 阿希/阿明 script when every LLM endpoint is unreachable."""
+    items = news_items[:5] or [
+        {
+            "source": "AI 日報",
+            "title": "今日未能即時取得外部新聞來源",
+            "link": "",
+        }
+    ]
+    lines: list[str] = [
+        "阿希: 各位早晨，歡迎收聽今日嘅 AI 日報。我係阿希。",
+        f"阿明: 早晨阿希，今日係 {date_label}，我準備好聽下最近有咩 AI 動態。",
+        "阿希: 好，我哋會用比較口語嘅方式，帶大家睇幾則重點。",
+        "阿明: 得，你開波啦。",
+    ]
+    for idx, item in enumerate(items, start=1):
+        title = (item.get("title") or "未命名新聞").strip()
+        source = (item.get("source") or "來源不詳").strip()
+        link = (item.get("link") or "").strip()
+        lines.extend(
+            [
+                f"阿希: 第{idx}則來自 {source}：{title}",
+                "阿明: 吓，咁係講緊咩嚟㗎？用淺白啲講得唔得？",
+                f"阿希: 簡單講，就係業界同公眾而家好關注呢單發展，標題已經交代咗核心事件。",
+                "阿明: 即係聽眾記住標題同來源，已經有個底？",
+                "阿希: 係呀。如果想跟進細節，可以之後自己睇原文。",
+                "阿明: 咁我嘅 takeaway 就係：留意事件本身，唔好被標題嚇窒。",
+            ]
+        )
+        if link:
+            lines.append(f"阿希: 原文連結係：{link}")
+            lines.append("阿明: 收到，我稍後會再睇。")
+    lines.extend(
+        [
+            "阿希: 今日就講到呢度。記住，以上係根據標題同來源整理嘅簡報版。",
+            "阿明: 多謝阿希。各位聽眾，我哋聽日再見。",
+            "阿希: 拜拜。",
+        ]
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _chat_completion(
@@ -345,14 +415,11 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
     tried: list[dict[str, str]] = []
     # Per-config transient retries for gateway/upstream blips before switching config.
     max_transient_retries = 2
-    # Skip other models on a base URL that already returned a gateway/upstream failure.
-    dead_base_urls: set[str] = set()
+    # After repeated gateway failures on a base+model, skip further sleeps on that base.
+    gateway_hits_by_base: dict[str, int] = {}
 
     for attempt_base, attempt_model in _apifree_fallback_configs(model, base_url):
         normalized_base = attempt_base.rstrip("/")
-        if normalized_base in dead_base_urls:
-            continue
-
         url = normalized_base + "/chat/completions"
         is_primary = normalized_base == base_url.rstrip("/") and attempt_model == model
         if is_primary:
@@ -431,7 +498,17 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
                     or _looks_like_gateway_error(err_msg)
                     or http_status in (502, 503, 504)
                 )
-                if is_gateway and transient_idx + 1 < max_transient_retries:
+                if is_gateway:
+                    gateway_hits_by_base[normalized_base] = (
+                        gateway_hits_by_base.get(normalized_base, 0) + 1
+                    )
+                # Only sleep/retry the first gateway hit per base; other models may
+                # still work on the same gateway (SkyClaw upstream vs general /v1).
+                if (
+                    is_gateway
+                    and transient_idx + 1 < max_transient_retries
+                    and gateway_hits_by_base.get(normalized_base, 0) <= 1
+                ):
                     sleep_s = 2 ** transient_idx
                     log(
                         f"Transient upstream/gateway error "
@@ -455,24 +532,6 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
                     # #endregion
                     time.sleep(sleep_s)
                     continue
-                if is_gateway:
-                    dead_base_urls.add(normalized_base)
-                    log(
-                        f"Marking base URL unhealthy, skipping sibling models: "
-                        f"{normalized_base}"
-                    )
-                    # #region agent log
-                    _agent_dbg(
-                        "B",
-                        "generate_script.py:call_openai:dead_base",
-                        "skipping remaining models on unhealthy base URL",
-                        {
-                            "base_url": normalized_base,
-                            "err_msg": err_msg[:160],
-                            "http_status": http_status,
-                        },
-                    )
-                    # #endregion
                 move_to_next_config = True
                 break
 
@@ -578,13 +637,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/agent/v1"),
+        # Official SkyClaw docs currently show /v1; /agent/v1 remains in the fallback list.
+        default=os.getenv("OPENAI_BASE_URL", "https://api.apifree.ai/v1"),
+    )
+    parser.add_argument(
+        "--require-llm",
+        action="store_true",
+        default=os.getenv("REQUIRE_LLM", "").strip().lower() in ("1", "true", "yes"),
+        help="Fail if the LLM is unreachable instead of writing an offline script",
     )
     args = parser.parse_args()
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY is required")
+    if not api_key and args.require_llm:
+        raise SystemExit("OPENAI_API_KEY is required when --require-llm is set")
 
     news_path = Path(args.news)
     if not news_path.exists():
@@ -595,12 +661,46 @@ def main() -> None:
     date_label = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log(f"Using {len(news_items)} news items for script generation")
 
-    script = call_openai(
-        api_key=api_key,
-        model=args.model,
-        base_url=args.base_url,
-        user_prompt=build_user_prompt(news_items, date_label),
-    )
+    script: str | None = None
+    if api_key:
+        try:
+            script = call_openai(
+                api_key=api_key,
+                model=args.model,
+                base_url=args.base_url,
+                user_prompt=build_user_prompt(news_items, date_label),
+            )
+        except RuntimeError as exc:
+            # #region agent log
+            _agent_dbg(
+                "F",
+                "generate_script.py:main:llm_failed",
+                "LLM exhausted; considering offline fallback",
+                {
+                    "require_llm": bool(args.require_llm),
+                    "error_prefix": str(exc)[:240],
+                },
+            )
+            # #endregion
+            if args.require_llm:
+                raise
+            log(f"LLM unavailable ({exc}); using offline script fallback")
+    elif args.require_llm:
+        raise SystemExit("OPENAI_API_KEY is required")
+    else:
+        log("OPENAI_API_KEY missing; using offline script fallback")
+
+    if script is None:
+        script = build_offline_script(news_items, date_label)
+        # #region agent log
+        _agent_dbg(
+            "F",
+            "generate_script.py:main:offline_script",
+            "wrote deterministic offline dialogue",
+            {"chars": len(script), "news_count": len(news_items)},
+        )
+        # #endregion
+
     script = normalize_script(script)
 
     output_path = Path(args.output)
