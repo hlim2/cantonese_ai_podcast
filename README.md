@@ -22,6 +22,8 @@ to APIFree SkyClaw:
 
 If GitHub **Variables** point at a model that APIFree does not host (for example `qwen/qwen3-32b` on `https://api.apifree.ai/v1`), `generate_script.py` automatically retries SkyClaw on the `/agent/v1` endpoint before failing.
 
+It also treats gateway blips such as HTTP 200 with body `no healthy upstream` as recoverable: a short same-config retry, then the other base URL (`/agent/v1` ↔ `/v1`) and alternate SkyClaw model ids.
+
 Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 
 **3. Synthesize audio**

@@ -7,11 +7,25 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
+
+# Transient gateway / proxy failures that should trigger retry + alternate configs.
+_GATEWAY_ERROR_MARKERS = (
+    "no healthy upstream",
+    "upstream connect error",
+    "connection refused",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "503 service",
+    "502 bad",
+    "504 gateway",
+)
 
 SYSTEM_PROMPT = """你係「AI 日報」粵語 Podcast 編劇。
 請用香港粵語口語（書面可以夾雜粵語詞），寫一段雙主持對話稿。
@@ -46,8 +60,6 @@ def log(message: str) -> None:
 # #region agent log
 def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
     """Safe NDJSON debug to stderr + local file. Never logs secrets."""
-    import time
-
     payload = {
         "sessionId": "840db8",
         "runId": os.getenv("GITHUB_RUN_ID", "local"),
@@ -185,10 +197,17 @@ def flatten_news(payload: dict[str, Any]) -> list[dict[str, str]]:
     return unique
 
 
+def _looks_like_gateway_error(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _GATEWAY_ERROR_MARKERS)
+
+
 def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
     """True when retrying another apifree model/base URL may succeed."""
     if not isinstance(data, dict):
         return False
+    if data.get("_non_json") or data.get("_transport_error"):
+        return True
     if isinstance(data.get("code"), int) and int(data["code"]) >= 400:
         return True
     err = data.get("error")
@@ -196,9 +215,17 @@ def _is_recoverable_apifree_error(data: dict[str, Any]) -> bool:
         return False
     code = str(err.get("code") or "").lower()
     msg = str(err.get("message") or "").lower()
-    if code in ("model_not_found", "model_schema_not_found"):
+    if code in (
+        "model_not_found",
+        "model_schema_not_found",
+        "upstream_error",
+        "server_error",
+        "timeout",
+    ):
         return True
     if "model schema not found" in msg or "model not exist" in msg:
+        return True
+    if _looks_like_gateway_error(msg):
         return True
     return False
 
@@ -237,36 +264,60 @@ def _chat_completion(
     model: str,
     base_url: str,
     user_prompt: str,
-) -> tuple[requests.Response, dict[str, Any]]:
+) -> tuple[requests.Response | None, dict[str, Any]]:
+    """POST chat/completions. Gateway/non-JSON failures return a synthetic error dict."""
     url = base_url.rstrip("/") + "/chat/completions"
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "temperature": 0.7,
-            # Required by APIFree for Qwen3; harmless for other chat models.
-            "enable_thinking": False,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
-        timeout=180,
-    )
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0.7,
+                # Required by APIFree for Qwen3; harmless for other chat models.
+                "enable_thinking": False,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+            timeout=180,
+        )
+    except requests.RequestException as exc:
+        return None, {
+            "_transport_error": True,
+            "code": 503,
+            "error": {
+                "code": "upstream_error",
+                "message": f"{type(exc).__name__}: {exc}"[:500],
+            },
+        }
+
     try:
         data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"API returned non-JSON (HTTP {response.status_code}): {response.text[:1000]}"
-        ) from exc
+    except ValueError:
+        body = (response.text or "").strip()
+        return response, {
+            "_non_json": True,
+            "code": response.status_code if response.status_code >= 400 else 503,
+            "error": {
+                "code": "upstream_error",
+                "message": body[:500] or f"empty non-JSON body (HTTP {response.status_code})",
+            },
+            "raw_prefix": body[:120],
+        }
     if not isinstance(data, dict):
-        raise RuntimeError(
-            f"Unexpected API response type (model={model}): {data!r}"
-        )
+        return response, {
+            "_non_json": True,
+            "code": 502,
+            "error": {
+                "code": "upstream_error",
+                "message": f"Unexpected API response type: {type(data).__name__}",
+            },
+        }
     return response, data
 
 
@@ -292,10 +343,18 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
     last_error: dict[str, Any] | None = None
     last_status = 0
     tried: list[dict[str, str]] = []
+    # Per-config transient retries for gateway/upstream blips before switching config.
+    max_transient_retries = 2
+    # Skip other models on a base URL that already returned a gateway/upstream failure.
+    dead_base_urls: set[str] = set()
 
     for attempt_base, attempt_model in _apifree_fallback_configs(model, base_url):
-        url = attempt_base.rstrip("/") + "/chat/completions"
-        is_primary = attempt_base.rstrip("/") == base_url.rstrip("/") and attempt_model == model
+        normalized_base = attempt_base.rstrip("/")
+        if normalized_base in dead_base_urls:
+            continue
+
+        url = normalized_base + "/chat/completions"
+        is_primary = normalized_base == base_url.rstrip("/") and attempt_model == model
         if is_primary:
             log(f"LLM endpoint={attempt_base} model={attempt_model}")
         else:
@@ -305,83 +364,158 @@ def call_openai(api_key: str, model: str, base_url: str, user_prompt: str) -> st
             )
         tried.append({"base_url": attempt_base, "model": attempt_model})
 
-        # #region agent log
-        _agent_dbg(
-            "A,B",
-            "generate_script.py:call_openai:pre",
-            "request metadata",
-            {
-                "url": url,
-                "base_url": attempt_base,
-                "model": attempt_model,
-                "base_has_agent": "/agent" in attempt_base,
-                "prompt_chars": len(user_prompt),
-                "key_present": bool(api_key),
-                "key_length": len(api_key),
-                "is_primary": is_primary,
-            },
-        )
-        # #endregion
-
-        response, data = _chat_completion(
-            api_key, attempt_model, attempt_base, user_prompt
-        )
-
-        # #region agent log
-        err = data.get("error")
-        _agent_dbg(
-            "A,B,C",
-            "generate_script.py:call_openai:post",
-            "response metadata",
-            {
-                "http_status": response.status_code,
-                "has_choices": "choices" in data,
-                "body_code": data.get("code"),
-                "error_code": err.get("code") if isinstance(err, dict) else None,
-                "error_message": err.get("message") if isinstance(err, dict) else None,
-                "served_by": data.get("served_by"),
-                "top_keys": sorted(data.keys()),
-                "model": attempt_model,
-                "base_url": attempt_base,
-            },
-        )
-        # #endregion
-
-        if response.status_code >= 400:
-            last_error = data
-            last_status = response.status_code
-            continue
-
-        if data.get("error") or (
-            isinstance(data.get("code"), int) and int(data["code"]) >= 400
-        ):
-            last_error = data
-            last_status = response.status_code
-            if _is_recoverable_apifree_error(data):
-                continue
-            break
-
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            last_error = data
-            last_status = response.status_code
-            if _is_recoverable_apifree_error(data):
-                continue
-            raise RuntimeError(
-                f"Unexpected API response (model={attempt_model}): {data}"
-            ) from exc
-
-        if not content or not str(content).strip():
-            last_error = {"error": {"message": "empty content"}}
-            last_status = response.status_code
-            continue
-
-        if not is_primary:
-            log(
-                f"Recovered using fallback LLM config: {attempt_base} / {attempt_model}"
+        move_to_next_config = False
+        for transient_idx in range(max_transient_retries):
+            # #region agent log
+            _agent_dbg(
+                "A,B",
+                "generate_script.py:call_openai:pre",
+                "request metadata",
+                {
+                    "url": url,
+                    "base_url": attempt_base,
+                    "model": attempt_model,
+                    "base_has_agent": "/agent" in attempt_base,
+                    "prompt_chars": len(user_prompt),
+                    "key_present": bool(api_key),
+                    "key_length": len(api_key),
+                    "is_primary": is_primary,
+                    "transient_attempt": transient_idx + 1,
+                },
             )
-        return str(content).strip()
+            # #endregion
+
+            response, data = _chat_completion(
+                api_key, attempt_model, attempt_base, user_prompt
+            )
+            http_status = (
+                response.status_code
+                if response is not None
+                else int(data.get("code") or 503)
+            )
+
+            # #region agent log
+            err = data.get("error")
+            _agent_dbg(
+                "A,B,C",
+                "generate_script.py:call_openai:post",
+                "response metadata",
+                {
+                    "http_status": http_status,
+                    "has_choices": "choices" in data,
+                    "body_code": data.get("code"),
+                    "error_code": err.get("code") if isinstance(err, dict) else None,
+                    "error_message": (
+                        err.get("message") if isinstance(err, dict) else None
+                    ),
+                    "served_by": data.get("served_by"),
+                    "top_keys": sorted(data.keys()),
+                    "model": attempt_model,
+                    "base_url": attempt_base,
+                    "non_json": bool(data.get("_non_json")),
+                    "transport_error": bool(data.get("_transport_error")),
+                    "transient_attempt": transient_idx + 1,
+                },
+            )
+            # #endregion
+
+            if http_status >= 400 or data.get("_non_json") or data.get("_transport_error"):
+                last_error = data
+                last_status = http_status
+                err_msg = ""
+                if isinstance(err, dict):
+                    err_msg = str(err.get("message") or "")
+                is_gateway = bool(
+                    data.get("_non_json")
+                    or data.get("_transport_error")
+                    or _looks_like_gateway_error(err_msg)
+                    or http_status in (502, 503, 504)
+                )
+                if is_gateway and transient_idx + 1 < max_transient_retries:
+                    sleep_s = 2 ** transient_idx
+                    log(
+                        f"Transient upstream/gateway error "
+                        f"(HTTP {http_status}): "
+                        f"{err_msg[:120] or data.get('raw_prefix', '')!r}; "
+                        f"sleeping {sleep_s}s then retrying same config"
+                    )
+                    # #region agent log
+                    _agent_dbg(
+                        "C",
+                        "generate_script.py:call_openai:transient_retry",
+                        "sleeping before same-config retry",
+                        {
+                            "sleep_s": sleep_s,
+                            "http_status": http_status,
+                            "err_msg": err_msg[:160],
+                            "base_url": attempt_base,
+                            "model": attempt_model,
+                        },
+                    )
+                    # #endregion
+                    time.sleep(sleep_s)
+                    continue
+                if is_gateway:
+                    dead_base_urls.add(normalized_base)
+                    log(
+                        f"Marking base URL unhealthy, skipping sibling models: "
+                        f"{normalized_base}"
+                    )
+                    # #region agent log
+                    _agent_dbg(
+                        "B",
+                        "generate_script.py:call_openai:dead_base",
+                        "skipping remaining models on unhealthy base URL",
+                        {
+                            "base_url": normalized_base,
+                            "err_msg": err_msg[:160],
+                            "http_status": http_status,
+                        },
+                    )
+                    # #endregion
+                move_to_next_config = True
+                break
+
+            if data.get("error") or (
+                isinstance(data.get("code"), int) and int(data["code"]) >= 400
+            ):
+                last_error = data
+                last_status = http_status
+                if _is_recoverable_apifree_error(data):
+                    move_to_next_config = True
+                    break
+                raise RuntimeError(
+                    f"API error (HTTP {last_status}, model={attempt_model}, "
+                    f"base_url={attempt_base}): {last_error!r}"
+                )
+
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                last_error = data
+                last_status = http_status
+                if _is_recoverable_apifree_error(data):
+                    move_to_next_config = True
+                    break
+                raise RuntimeError(
+                    f"Unexpected API response (model={attempt_model}): {data}"
+                ) from exc
+
+            if not content or not str(content).strip():
+                last_error = {"error": {"message": "empty content"}}
+                last_status = http_status
+                move_to_next_config = True
+                break
+
+            if not is_primary or transient_idx > 0:
+                log(
+                    f"Recovered using LLM config: {attempt_base} / {attempt_model} "
+                    f"(transient_attempt={transient_idx + 1})"
+                )
+            return str(content).strip()
+
+        if move_to_next_config:
+            continue
 
     # #region agent log
     err_msg = ""
