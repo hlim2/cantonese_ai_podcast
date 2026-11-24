@@ -59,18 +59,17 @@ jobs:
 
       - name: Synthesize podcast MP3
         env:
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          # Voice IDs from your ElevenLabs library (Cantonese-capable voices recommended).
-          # Prefer repo Variables; secrets also work if you store them there instead.
-          ELEVENLABS_VOICE_AH_HEI: ${{ vars.ELEVENLABS_VOICE_AH_HEI }}
-          ELEVENLABS_VOICE_AH_MING: ${{ vars.ELEVENLABS_VOICE_AH_MING }}
-          ELEVENLABS_MODEL: ${{ vars.ELEVENLABS_MODEL || 'eleven_v4_turbo' }}
-          ELEVENLABS_OUTPUT_FORMAT: ${{ vars.ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128' }}
-          ELEVENLABS_LANGUAGE_CODE: ${{ vars.ELEVENLABS_LANGUAGE_CODE || '' }}
-          ELEVENLABS_BASE_URL: ${{ vars.ELEVENLABS_BASE_URL || 'https://api.elevenlabs.io' }}
+          # OpenRouter routes ElevenLabs TTS (elevenlabs/eleven-v4-turbo).
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_TTS_MODEL: ${{ vars.OPENROUTER_TTS_MODEL || 'elevenlabs/eleven-v4-turbo' }}
+          OPENROUTER_BASE_URL: ${{ vars.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' }}
+          OPENROUTER_TTS_FORMAT: ${{ vars.OPENROUTER_TTS_FORMAT || 'mp3' }}
+          # OpenRouter voice names (sarah/george/…), not ElevenLabs dashboard IDs.
+          OPENROUTER_VOICE_AH_HEI: ${{ vars.OPENROUTER_VOICE_AH_HEI || 'sarah' }}
+          OPENROUTER_VOICE_AH_MING: ${{ vars.OPENROUTER_VOICE_AH_MING || 'george' }}
         run: |
           DATE_UTC=$(date -u +%Y%m%d)
-          echo "Using ElevenLabs model=$ELEVENLABS_MODEL"
+          echo "Using OpenRouter TTS model=$OPENROUTER_TTS_MODEL"
           python scripts/synthesize_podcast.py \
             --script podcast_script.md \
             --output "AI_Daily_Podcast_${DATE_UTC}.mp3"
