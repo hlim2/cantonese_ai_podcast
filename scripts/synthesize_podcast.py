@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthesize a multi-speaker Cantonese podcast MP3 with ElevenLabs + ffmpeg."""
+"""Synthesize a multi-speaker Cantonese podcast MP3 via OpenRouter ElevenLabs TTS."""
 
 from __future__ import annotations
 
@@ -18,24 +18,64 @@ from typing import Any
 
 import requests
 
-# ElevenLabs Text-to-Dialogue: keep total input text <= 2000 chars per request.
-MAX_CHUNK_CHARS = int(os.getenv("ELEVENLABS_MAX_CHUNK_CHARS", "1800"))
-ELEVENLABS_BASE_URL = os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io").rstrip("/")
-ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v4_turbo")
-ELEVENLABS_OUTPUT_FORMAT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128")
-ELEVENLABS_LANGUAGE_CODE = os.getenv("ELEVENLABS_LANGUAGE_CODE", "").strip()
+# OpenRouter ElevenLabs models accept up to ~10k characters per request.
+MAX_CHUNK_CHARS = int(os.getenv("OPENROUTER_TTS_MAX_CHUNK_CHARS", "4000"))
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+).rstrip("/")
+OPENROUTER_TTS_MODEL = os.getenv(
+    "OPENROUTER_TTS_MODEL", "elevenlabs/eleven-v4-turbo"
+)
+OPENROUTER_TTS_FORMAT = os.getenv("OPENROUTER_TTS_FORMAT", "mp3").strip() or "mp3"
+
+# Published voices for elevenlabs/eleven-v4-turbo on OpenRouter.
+# Opaque ElevenLabs dashboard IDs (e.g. pyCpQJNpFBywhVAwOzn6) are NOT accepted.
+OPENROUTER_VOICES = frozenset(
+    {
+        "george",
+        "sarah",
+        "adam",
+        "alice",
+        "bella",
+        "bill",
+        "brian",
+        "callum",
+        "charlie",
+        "chris",
+        "daniel",
+        "eric",
+        "harry",
+        "jessica",
+        "laura",
+        "liam",
+        "lily",
+        "matilda",
+        "river",
+        "roger",
+        "will",
+    }
+)
+
+
+def _resolve_named_voice(*env_keys: str, default: str) -> str:
+    for key in env_keys:
+        raw = (os.getenv(key) or "").strip().lower()
+        if raw in OPENROUTER_VOICES:
+            return raw
+    return default
+
 
 SPEAKER_VOICES = {
-    "阿希": (
-        os.getenv("ELEVENLABS_VOICE_AH_HEI")
-        or os.getenv("VOICE_AH_HEI")
-        or ""
-    ).strip(),
-    "阿明": (
-        os.getenv("ELEVENLABS_VOICE_AH_MING")
-        or os.getenv("VOICE_AH_MING")
-        or ""
-    ).strip(),
+    "阿希": _resolve_named_voice(
+        "OPENROUTER_VOICE_AH_HEI",
+        "VOICE_AH_HEI",
+        default="sarah",
+    ),
+    "阿明": _resolve_named_voice(
+        "OPENROUTER_VOICE_AH_MING",
+        "VOICE_AH_MING",
+        default="george",
+    ),
 }
 
 LINE_RE = re.compile(r"^(阿希|阿明)\s*[:：]\s*(.+)$")
@@ -91,19 +131,13 @@ def sanitize_tts_text(text: str) -> str:
 
 
 def require_config() -> str:
-    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    api_key = (
+        os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or ""
+    ).strip()
     if not api_key:
         raise RuntimeError(
-            "ELEVENLABS_API_KEY is required for ElevenLabs TTS "
-            f"(model={ELEVENLABS_MODEL})"
-        )
-    missing = [name for name, voice in SPEAKER_VOICES.items() if not voice]
-    if missing:
-        raise RuntimeError(
-            "Missing ElevenLabs voice IDs for: "
-            + ", ".join(missing)
-            + ". Set ELEVENLABS_VOICE_AH_HEI / ELEVENLABS_VOICE_AH_MING "
-            "(or VOICE_AH_HEI / VOICE_AH_MING)."
+            "OPENROUTER_API_KEY is required for OpenRouter TTS "
+            f"(model={OPENROUTER_TTS_MODEL})"
         )
     return api_key
 
@@ -111,36 +145,50 @@ def require_config() -> str:
 def chunk_dialogue(
     dialogue: list[tuple[str, str]],
     max_chars: int = MAX_CHUNK_CHARS,
-) -> list[list[dict[str, str]]]:
-    """Group dialogue lines into Text-to-Dialogue request payloads."""
-    chunks: list[list[dict[str, str]]] = []
-    current: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    """Group consecutive same-speaker lines into OpenRouter speech requests.
+
+    ElevenLabs via OpenRouter does not accept multi-speaker turn arrays, so each
+    chunk is a single voice + concatenated text.
+    """
+    chunks: list[dict[str, Any]] = []
+    current_speaker: str | None = None
+    current_texts: list[str] = []
     current_chars = 0
+
+    def flush() -> None:
+        nonlocal current_speaker, current_texts, current_chars
+        if current_speaker and current_texts:
+            chunks.append(
+                {
+                    "speaker": current_speaker,
+                    "voice": SPEAKER_VOICES[current_speaker],
+                    "text": " ".join(current_texts),
+                    "line_count": len(current_texts),
+                }
+            )
+        current_speaker = None
+        current_texts = []
+        current_chars = 0
 
     for speaker, content in dialogue:
         text = sanitize_tts_text(content)
         if not text:
             continue
-        voice_id = SPEAKER_VOICES[speaker]
-        item = {"text": text, "voice_id": voice_id}
-        item_len = len(text)
+        text_len = len(text)
+        same_speaker = speaker == current_speaker
+        would_overflow = current_texts and current_chars + 1 + text_len > max_chars
+        if current_texts and (not same_speaker or would_overflow):
+            flush()
 
-        if current and current_chars + item_len > max_chars:
-            chunks.append(current)
-            current = []
-            current_chars = 0
-
-        # A single oversized line still gets its own request.
-        current.append(item)
-        current_chars += item_len
+        current_speaker = speaker
+        current_texts.append(text)
+        current_chars += text_len if len(current_texts) == 1 else 1 + text_len
 
         if current_chars >= max_chars:
-            chunks.append(current)
-            current = []
-            current_chars = 0
+            flush()
 
-    if current:
-        chunks.append(current)
+    flush()
     return chunks
 
 
@@ -150,6 +198,9 @@ def _error_detail(response: requests.Response) -> str:
     except ValueError:
         return (response.text or "")[:500]
     if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or err)[:500]
         detail = payload.get("detail") or payload.get("message") or payload
         return str(detail)[:500]
     return str(payload)[:500]
@@ -157,28 +208,30 @@ def _error_detail(response: requests.Response) -> str:
 
 def synthesize_chunk(
     api_key: str,
-    inputs: list[dict[str, str]],
-    output_path: Path,
     *,
-    previous_request_ids: list[str] | None = None,
+    text: str,
+    voice: str,
+    output_path: Path,
     max_attempts: int = 4,
 ) -> str | None:
-    """Call ElevenLabs Text-to-Dialogue and write mp3 bytes. Returns request-id."""
-    url = f"{ELEVENLABS_BASE_URL}/v1/text-to-dialogue"
-    params = {"output_format": ELEVENLABS_OUTPUT_FORMAT}
+    """Call OpenRouter /audio/speech and write mp3 bytes. Returns generation id."""
+    url = f"{OPENROUTER_BASE_URL}/audio/speech"
     body: dict[str, Any] = {
-        "inputs": inputs,
-        "model_id": ELEVENLABS_MODEL,
+        "model": OPENROUTER_TTS_MODEL,
+        "input": text,
+        "voice": voice,
+        "response_format": OPENROUTER_TTS_FORMAT,
+        "provider": {"only": ["elevenlabs"]},
     }
-    if ELEVENLABS_LANGUAGE_CODE:
-        body["language_code"] = ELEVENLABS_LANGUAGE_CODE
-    if previous_request_ids:
-        body["previous_request_ids"] = previous_request_ids[-3:]
-
     headers = {
-        "xi-api-key": api_key,
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "Accept": "audio/mpeg",
+        "Accept": "audio/mpeg, application/json",
+        "HTTP-Referer": os.getenv(
+            "OPENROUTER_HTTP_REFERER",
+            "https://github.com/hlim2/cantonese_ai_podcast",
+        ),
+        "X-Title": os.getenv("OPENROUTER_APP_TITLE", "cantonese_ai_podcast"),
     }
 
     last_error: Exception | None = None
@@ -186,24 +239,26 @@ def synthesize_chunk(
         try:
             response = requests.post(
                 url,
-                params=params,
                 headers=headers,
                 json=body,
                 timeout=180,
             )
-            if response.status_code == 200 and response.content:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if (
+                response.status_code == 200
+                and response.content
+                and "application/json" not in content_type
+            ):
                 output_path.write_bytes(response.content)
-                request_id = (
-                    response.headers.get("request-id")
-                    or response.headers.get("x-request-id")
+                return (
+                    response.headers.get("X-Generation-Id")
+                    or response.headers.get("x-generation-id")
                 )
-                return request_id
 
             detail = _error_detail(response)
-            # Retry transient / rate-limit responses.
             if response.status_code in {408, 429, 500, 502, 503, 504}:
                 last_error = RuntimeError(
-                    f"ElevenLabs HTTP {response.status_code}: {detail}"
+                    f"OpenRouter TTS HTTP {response.status_code}: {detail}"
                 )
                 log(
                     f"TTS chunk retry {attempt}/{max_attempts} "
@@ -213,7 +268,7 @@ def synthesize_chunk(
                 continue
 
             raise RuntimeError(
-                f"ElevenLabs HTTP {response.status_code}: {detail}"
+                f"OpenRouter TTS HTTP {response.status_code}: {detail}"
             )
         except requests.RequestException as exc:
             last_error = exc
@@ -222,9 +277,8 @@ def synthesize_chunk(
                 time.sleep(1.5 * attempt)
 
     raise RuntimeError(
-        f"ElevenLabs TTS failed after {max_attempts} attempts "
-        f"for {len(inputs)} lines / "
-        f"{sum(len(i['text']) for i in inputs)} chars"
+        f"OpenRouter TTS failed after {max_attempts} attempts "
+        f"for voice={voice} chars={len(text)}"
     ) from last_error
 
 
@@ -277,7 +331,7 @@ def build_podcast(script_path: Path, output_mp3: Path) -> None:
 
     log(
         f"Synthesizing {len(dialogue)} dialogue lines in {len(chunks)} "
-        f"ElevenLabs chunk(s) model={ELEVENLABS_MODEL}"
+        f"OpenRouter chunk(s) model={OPENROUTER_TTS_MODEL}"
     )
     _agent_dbg(
         "TTS-A",
@@ -286,23 +340,22 @@ def build_podcast(script_path: Path, output_mp3: Path) -> None:
         {
             "line_count": len(dialogue),
             "chunk_count": len(chunks),
-            "model": ELEVENLABS_MODEL,
-            "voices": {k: (v[:6] + "…") if v else "" for k, v in SPEAKER_VOICES.items()},
-            "base_url": ELEVENLABS_BASE_URL,
+            "model": OPENROUTER_TTS_MODEL,
+            "voices": SPEAKER_VOICES,
+            "base_url": OPENROUTER_BASE_URL,
         },
     )
 
     with tempfile.TemporaryDirectory(prefix="podcast-tts-") as tmp:
         tmp_dir = Path(tmp)
         parts: list[Path] = []
-        previous_ids: list[str] = []
 
-        for idx, inputs in enumerate(chunks, start=1):
+        for idx, chunk in enumerate(chunks, start=1):
             part_path = tmp_dir / f"part_{idx:04d}.mp3"
-            char_count = sum(len(item["text"]) for item in inputs)
             log(
-                f"[{idx}/{len(chunks)}] lines={len(inputs)} chars={char_count} "
-                f"model={ELEVENLABS_MODEL}"
+                f"[{idx}/{len(chunks)}] speaker={chunk['speaker']} "
+                f"voice={chunk['voice']} lines={chunk['line_count']} "
+                f"chars={len(chunk['text'])} model={OPENROUTER_TTS_MODEL}"
             )
             _agent_dbg(
                 "TTS-A,TTS-B",
@@ -311,21 +364,20 @@ def build_podcast(script_path: Path, output_mp3: Path) -> None:
                 {
                     "idx": idx,
                     "total": len(chunks),
-                    "lines": len(inputs),
-                    "chars": char_count,
-                    "preview": inputs[0]["text"][:80],
+                    "speaker": chunk["speaker"],
+                    "voice": chunk["voice"],
+                    "lines": chunk["line_count"],
+                    "chars": len(chunk["text"]),
+                    "preview": chunk["text"][:80],
                 },
             )
-            request_id = synthesize_chunk(
+            synthesize_chunk(
                 api_key,
-                inputs,
-                part_path,
-                previous_request_ids=previous_ids or None,
+                text=chunk["text"],
+                voice=chunk["voice"],
+                output_path=part_path,
             )
-            if request_id:
-                previous_ids.append(request_id)
             parts.append(part_path)
-            # Light pacing between chunks to reduce rate-limit pressure.
             if idx < len(chunks):
                 time.sleep(0.35)
 

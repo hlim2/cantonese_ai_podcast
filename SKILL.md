@@ -51,25 +51,25 @@ Save the generated script as a Markdown file (e.g., `/home/ubuntu/podcast_script
 
 ### Phase 3: Speech Synthesis
 
-Synthesize the script with ElevenLabs Text-to-Dialogue via `scripts/synthesize_podcast.py`:
+Synthesize the script via OpenRouter ElevenLabs TTS (`scripts/synthesize_podcast.py`):
 
 ```bash
-export ELEVENLABS_API_KEY=...
-export ELEVENLABS_VOICE_AH_HEI=<voice_id_for_ah_hei>
-export ELEVENLABS_VOICE_AH_MING=<voice_id_for_ah_ming>
-# Optional; default is eleven_v4_turbo
-export ELEVENLABS_MODEL=eleven_v4_turbo
+export OPENROUTER_API_KEY=...
+# Optional OpenRouter voice names (defaults: sarah / george)
+export OPENROUTER_VOICE_AH_HEI=sarah
+export OPENROUTER_VOICE_AH_MING=george
+export OPENROUTER_TTS_MODEL=elevenlabs/eleven-v4-turbo
 
 python3 scripts/synthesize_podcast.py \
   --script podcast_script.md \
   --output AI_Daily_Podcast_YYYYMMDD.mp3
 ```
 
--   **阿希 (Ah Hei)**: `ELEVENLABS_VOICE_AH_HEI` (ElevenLabs voice ID)
--   **阿明 (Ah Ming)**: `ELEVENLABS_VOICE_AH_MING` (ElevenLabs voice ID)
--   **Model**: `eleven_v4_turbo` by default (override with `ELEVENLABS_MODEL`)
+-   **阿希 (Ah Hei)**: `OPENROUTER_VOICE_AH_HEI` (default `sarah`)
+-   **阿明 (Ah Ming)**: `OPENROUTER_VOICE_AH_MING` (default `george`)
+-   **Model**: `elevenlabs/eleven-v4-turbo` via OpenRouter `/api/v1/audio/speech`
 
-The script chunks dialogue for the Text-to-Dialogue 2k-character limit and concatenates MP3 parts with `ffmpeg`.
+The script groups consecutive same-speaker lines and concatenates MP3 parts with `ffmpeg`.
 
 ### Phase 4: Deliver Results
 

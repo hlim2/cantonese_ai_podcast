@@ -38,18 +38,19 @@ Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 scripts/synthesize_podcast.py:
 
 parses each dialogue line
-batches them into ElevenLabs **Text-to-Dialogue** requests (≤~1800 chars each)
-speaks them with **ElevenLabs** (`eleven_v4_turbo` by default)
+groups consecutive same-speaker lines
+speaks them via **OpenRouter** → ElevenLabs (`elevenlabs/eleven-v4-turbo`)
 merges chunks with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
 
 | Setting | Typical value |
 |---------|---------------|
-| ELEVENLABS_API_KEY | ElevenLabs API key (secret) |
-| ELEVENLABS_VOICE_AH_HEI | Voice ID for 阿希 |
-| ELEVENLABS_VOICE_AH_MING | Voice ID for 阿明 |
-| ELEVENLABS_MODEL | `eleven_v4_turbo` (override with `eleven_v4` for long-form quality) |
+| OPENROUTER_API_KEY | OpenRouter API key (secret) |
+| OPENROUTER_TTS_MODEL | `elevenlabs/eleven-v4-turbo` |
+| OPENROUTER_VOICE_AH_HEI | `sarah` (OpenRouter voice name) |
+| OPENROUTER_VOICE_AH_MING | `george` (OpenRouter voice name) |
 
-Optional: `ELEVENLABS_OUTPUT_FORMAT`, `ELEVENLABS_LANGUAGE_CODE`, `ELEVENLABS_BASE_URL`, `ELEVENLABS_MAX_CHUNK_CHARS`.
+Use OpenRouter voice **names** (`sarah`, `george`, `alice`, …), not ElevenLabs
+dashboard voice IDs. Optional: `OPENROUTER_BASE_URL`, `OPENROUTER_TTS_FORMAT`.
 
 **4. Deliver to Telegram**
 curl sendDocument uploads:
@@ -61,4 +62,4 @@ using secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
 TELEGRAM_CHAT_ID = Telegram group/channel ID, check ID with @IDBot
 TELEGRAM_BOT_TOKEN = Bot ID, check ID with @BotFather or @IDBot
 
-That’s the full path: **crawled news + 編劇 prompt → LLM script → ElevenLabs TTS → Telegram files.**
+That’s the full path: **crawled news + 編劇 prompt → LLM script → OpenRouter ElevenLabs TTS → Telegram files.**
