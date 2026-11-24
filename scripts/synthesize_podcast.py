@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Synthesize a multi-speaker Cantonese podcast MP3 with edge-tts + ffmpeg."""
+"""Synthesize a multi-speaker Cantonese podcast MP3 with ElevenLabs + ffmpeg."""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import re
@@ -15,37 +14,32 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-import edge_tts
-import edge_tts.communicate as edge_communicate
-from aiohttp import ClientResponseError
-from edge_tts.constants import TRUSTED_CLIENT_TOKEN, WSS_URL as LEGACY_WSS_URL
-from edge_tts.exceptions import NoAudioReceived
+import requests
+
+# ElevenLabs Text-to-Dialogue: keep total input text <= 2000 chars per request.
+MAX_CHUNK_CHARS = int(os.getenv("ELEVENLABS_MAX_CHUNK_CHARS", "1800"))
+ELEVENLABS_BASE_URL = os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io").rstrip("/")
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v4_turbo")
+ELEVENLABS_OUTPUT_FORMAT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128")
+ELEVENLABS_LANGUAGE_CODE = os.getenv("ELEVENLABS_LANGUAGE_CODE", "").strip()
 
 SPEAKER_VOICES = {
-    "阿希": os.getenv("VOICE_AH_HEI", "zh-HK-HiuMaanNeural"),
-    "阿明": os.getenv("VOICE_AH_MING", "zh-HK-WanLungNeural"),
+    "阿希": (
+        os.getenv("ELEVENLABS_VOICE_AH_HEI")
+        or os.getenv("VOICE_AH_HEI")
+        or ""
+    ).strip(),
+    "阿明": (
+        os.getenv("ELEVENLABS_VOICE_AH_MING")
+        or os.getenv("VOICE_AH_MING")
+        or ""
+    ).strip(),
 }
 
-# Microsoft moved Edge Read Aloud synthesis off speech.platform.bing.com (403
-# worldwide as of 2026-10-12). The Edge 155 host still accepts the legacy
-# Sec-MS-GEC token when passed as Ocp-Apim-Subscription-Key. See edge-tts#490.
-NEW_WSS_URL = (
-    "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
-    f"?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}"
-)
-TTS_WSS_URLS = (
-    os.getenv("EDGE_TTS_WSS_URL", "").strip() or NEW_WSS_URL,
-    LEGACY_WSS_URL,
-)
-
-# Slightly slower / warmer pacing for less mechanical delivery.
-TTS_RATE = os.getenv("TTS_RATE", "-8%")
-TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz")
-
 LINE_RE = re.compile(r"^(阿希|阿明)\s*[:：]\s*(.+)$")
-# Characters that often break Edge TTS / SSML parsing.
-UNSAFE_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f<>&]")
+UNSAFE_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def log(message: str) -> None:
@@ -96,154 +90,151 @@ def sanitize_tts_text(text: str) -> str:
     return cleaned
 
 
-def _wss_host(url: str) -> str:
-    return url.split("?", 1)[0]
+def require_config() -> str:
+    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "ELEVENLABS_API_KEY is required for ElevenLabs TTS "
+            f"(model={ELEVENLABS_MODEL})"
+        )
+    missing = [name for name, voice in SPEAKER_VOICES.items() if not voice]
+    if missing:
+        raise RuntimeError(
+            "Missing ElevenLabs voice IDs for: "
+            + ", ".join(missing)
+            + ". Set ELEVENLABS_VOICE_AH_HEI / ELEVENLABS_VOICE_AH_MING "
+            "(or VOICE_AH_HEI / VOICE_AH_MING)."
+        )
+    return api_key
 
 
-def configure_edge_tts_endpoint(url: str) -> None:
-    """Point edge-tts at a synthesis WebSocket URL (module-global used by Communicate)."""
-    edge_communicate.WSS_URL = url
-    log(f"edge-tts WSS endpoint={_wss_host(url)}")
+def chunk_dialogue(
+    dialogue: list[tuple[str, str]],
+    max_chars: int = MAX_CHUNK_CHARS,
+) -> list[list[dict[str, str]]]:
+    """Group dialogue lines into Text-to-Dialogue request payloads."""
+    chunks: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    current_chars = 0
+
+    for speaker, content in dialogue:
+        text = sanitize_tts_text(content)
+        if not text:
+            continue
+        voice_id = SPEAKER_VOICES[speaker]
+        item = {"text": text, "voice_id": voice_id}
+        item_len = len(text)
+
+        if current and current_chars + item_len > max_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+
+        # A single oversized line still gets its own request.
+        current.append(item)
+        current_chars += item_len
+
+        if current_chars >= max_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-async def synthesize_line(text: str, voice: str, output_path: Path) -> None:
-    communicate = edge_tts.Communicate(
-        text,
-        voice=voice,
-        rate=TTS_RATE,
-        pitch=TTS_PITCH,
-    )
-    await communicate.save(str(output_path))
+def _error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return (response.text or "")[:500]
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("message") or payload
+        return str(detail)[:500]
+    return str(payload)[:500]
 
 
-def _is_tts_handshake_403(exc: BaseException) -> bool:
-    if isinstance(exc, ClientResponseError) and getattr(exc, "status", None) == 403:
-        return True
-    text = str(exc)
-    return "403" in text and ("Invalid response status" in text or "WSServerHandshakeError" in type(exc).__name__)
-
-
-async def synthesize_line_with_retry(
-    idx: int,
-    total: int,
-    speaker: str,
-    content: str,
-    voice: str,
+def synthesize_chunk(
+    api_key: str,
+    inputs: list[dict[str, str]],
     output_path: Path,
+    *,
+    previous_request_ids: list[str] | None = None,
     max_attempts: int = 4,
-) -> None:
-    text = sanitize_tts_text(content)
-    # #region agent log
-    _agent_dbg(
-        "TTS-A,TTS-B,TTS-C",
-        "synthesize_podcast.py:line:pre",
-        "about to synthesize line",
-        {
-            "idx": idx,
-            "total": total,
-            "speaker": speaker,
-            "voice": voice,
-            "raw_len": len(content),
-            "sanitized_len": len(text),
-            "changed": text != content,
-            "preview": text[:80],
-            "has_url": "http://" in content.lower() or "https://" in content.lower(),
-            "wss_host": _wss_host(edge_communicate.WSS_URL),
-        },
-    )
-    # #endregion
-    if not text:
-        raise RuntimeError(f"Line {idx} is empty after sanitization")
+) -> str | None:
+    """Call ElevenLabs Text-to-Dialogue and write mp3 bytes. Returns request-id."""
+    url = f"{ELEVENLABS_BASE_URL}/v1/text-to-dialogue"
+    params = {"output_format": ELEVENLABS_OUTPUT_FORMAT}
+    body: dict[str, Any] = {
+        "inputs": inputs,
+        "model_id": ELEVENLABS_MODEL,
+    }
+    if ELEVENLABS_LANGUAGE_CODE:
+        body["language_code"] = ELEVENLABS_LANGUAGE_CODE
+    if previous_request_ids:
+        body["previous_request_ids"] = previous_request_ids[-3:]
+
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
 
     last_error: Exception | None = None
-    endpoint_index = 0
     for attempt in range(1, max_attempts + 1):
         try:
-            await synthesize_line(text, voice, output_path)
-            if attempt > 1:
-                # #region agent log
-                _agent_dbg(
-                    "TTS-B",
-                    "synthesize_podcast.py:line:retry_ok",
-                    "retry succeeded",
-                    {
-                        "idx": idx,
-                        "attempt": attempt,
-                        "wss_host": _wss_host(edge_communicate.WSS_URL),
-                    },
+            response = requests.post(
+                url,
+                params=params,
+                headers=headers,
+                json=body,
+                timeout=180,
+            )
+            if response.status_code == 200 and response.content:
+                output_path.write_bytes(response.content)
+                request_id = (
+                    response.headers.get("request-id")
+                    or response.headers.get("x-request-id")
                 )
-                # #endregion
-            return
-        except NoAudioReceived as exc:
-            last_error = exc
-            # #region agent log
-            _agent_dbg(
-                "TTS-B,TTS-C,TTS-D",
-                "synthesize_podcast.py:line:no_audio",
-                "NoAudioReceived",
-                {
-                    "idx": idx,
-                    "attempt": attempt,
-                    "speaker": speaker,
-                    "voice": voice,
-                    "text_len": len(text),
-                    "preview": text[:120],
-                },
-            )
-            # #endregion
-            if attempt < max_attempts:
-                await asyncio.sleep(1.5 * attempt)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            # #region agent log
-            _agent_dbg(
-                "TTS-D,TTS-E",
-                "synthesize_podcast.py:line:error",
-                "unexpected synthesize error",
-                {
-                    "idx": idx,
-                    "attempt": attempt,
-                    "exc_type": type(exc).__name__,
-                    "exc": str(exc)[:200],
-                    "preview": text[:120],
-                    "wss_host": _wss_host(edge_communicate.WSS_URL),
-                    "is_403": _is_tts_handshake_403(exc),
-                },
-            )
-            # #endregion
-            if _is_tts_handshake_403(exc) and endpoint_index + 1 < len(TTS_WSS_URLS):
-                endpoint_index += 1
-                next_url = TTS_WSS_URLS[endpoint_index]
+                return request_id
+
+            detail = _error_detail(response)
+            # Retry transient / rate-limit responses.
+            if response.status_code in {408, 429, 500, 502, 503, 504}:
+                last_error = RuntimeError(
+                    f"ElevenLabs HTTP {response.status_code}: {detail}"
+                )
                 log(
-                    "edge-tts handshake 403; failing over to "
-                    f"{_wss_host(next_url)}"
+                    f"TTS chunk retry {attempt}/{max_attempts} "
+                    f"HTTP {response.status_code}: {detail}"
                 )
-                configure_edge_tts_endpoint(next_url)
-                # #region agent log
-                _agent_dbg(
-                    "TTS-F",
-                    "synthesize_podcast.py:line:failover",
-                    "switched TTS websocket host after 403",
-                    {
-                        "idx": idx,
-                        "attempt": attempt,
-                        "wss_host": _wss_host(next_url),
-                    },
-                )
-                # #endregion
+                time.sleep(1.5 * attempt)
                 continue
+
+            raise RuntimeError(
+                f"ElevenLabs HTTP {response.status_code}: {detail}"
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            log(f"TTS chunk network error attempt {attempt}/{max_attempts}: {exc}")
             if attempt < max_attempts:
-                await asyncio.sleep(1.5 * attempt)
+                time.sleep(1.5 * attempt)
 
     raise RuntimeError(
-        f"TTS failed for line {idx}/{total} speaker={speaker} voice={voice} "
-        f"text_len={len(text)} preview={text[:80]!r}"
+        f"ElevenLabs TTS failed after {max_attempts} attempts "
+        f"for {len(inputs)} lines / "
+        f"{sum(len(i['text']) for i in inputs)} chars"
     ) from last_error
 
 
 def concat_with_ffmpeg(parts: list[Path], output_mp3: Path) -> None:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg is required but was not found on PATH")
+
+    if len(parts) == 1:
+        shutil.copyfile(parts[0], output_mp3)
+        return
 
     list_file = output_mp3.with_suffix(".txt")
     list_file.write_text(
@@ -271,7 +262,8 @@ def concat_with_ffmpeg(parts: list[Path], output_mp3: Path) -> None:
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr[-2000:]}")
 
 
-async def build_podcast(script_path: Path, output_mp3: Path) -> None:
+def build_podcast(script_path: Path, output_mp3: Path) -> None:
+    api_key = require_config()
     script_text = script_path.read_text(encoding="utf-8")
     dialogue = parse_dialogue(script_text)
     if not dialogue:
@@ -279,50 +271,73 @@ async def build_podcast(script_path: Path, output_mp3: Path) -> None:
             "No dialogue lines found. Expected lines like '阿希: ...' / '阿明: ...'"
         )
 
-    log(f"Synthesizing {len(dialogue)} dialogue lines")
-    configure_edge_tts_endpoint(TTS_WSS_URLS[0])
-    # #region agent log
+    chunks = chunk_dialogue(dialogue)
+    if not chunks:
+        raise RuntimeError("No synthesizable text after sanitization")
+
+    log(
+        f"Synthesizing {len(dialogue)} dialogue lines in {len(chunks)} "
+        f"ElevenLabs chunk(s) model={ELEVENLABS_MODEL}"
+    )
     _agent_dbg(
         "TTS-A",
         "synthesize_podcast.py:build:start",
         "dialogue parsed",
         {
             "line_count": len(dialogue),
-            "voices": SPEAKER_VOICES,
-            "wss_hosts": [_wss_host(u) for u in TTS_WSS_URLS],
+            "chunk_count": len(chunks),
+            "model": ELEVENLABS_MODEL,
+            "voices": {k: (v[:6] + "…") if v else "" for k, v in SPEAKER_VOICES.items()},
+            "base_url": ELEVENLABS_BASE_URL,
         },
     )
-    # #endregion
+
     with tempfile.TemporaryDirectory(prefix="podcast-tts-") as tmp:
         tmp_dir = Path(tmp)
         parts: list[Path] = []
-        for idx, (speaker, content) in enumerate(dialogue):
-            voice = SPEAKER_VOICES[speaker]
+        previous_ids: list[str] = []
+
+        for idx, inputs in enumerate(chunks, start=1):
             part_path = tmp_dir / f"part_{idx:04d}.mp3"
-            log(f"[{idx + 1}/{len(dialogue)}] {speaker} ({voice})")
-            await synthesize_line_with_retry(
-                idx=idx + 1,
-                total=len(dialogue),
-                speaker=speaker,
-                content=content,
-                voice=voice,
-                output_path=part_path,
+            char_count = sum(len(item["text"]) for item in inputs)
+            log(
+                f"[{idx}/{len(chunks)}] lines={len(inputs)} chars={char_count} "
+                f"model={ELEVENLABS_MODEL}"
             )
+            _agent_dbg(
+                "TTS-A,TTS-B",
+                "synthesize_podcast.py:chunk:pre",
+                "about to synthesize chunk",
+                {
+                    "idx": idx,
+                    "total": len(chunks),
+                    "lines": len(inputs),
+                    "chars": char_count,
+                    "preview": inputs[0]["text"][:80],
+                },
+            )
+            request_id = synthesize_chunk(
+                api_key,
+                inputs,
+                part_path,
+                previous_request_ids=previous_ids or None,
+            )
+            if request_id:
+                previous_ids.append(request_id)
             parts.append(part_path)
-            # Small pacing delay to reduce Edge TTS throttling.
-            await asyncio.sleep(0.35)
+            # Light pacing between chunks to reduce rate-limit pressure.
+            if idx < len(chunks):
+                time.sleep(0.35)
 
         output_mp3.parent.mkdir(parents=True, exist_ok=True)
         concat_with_ffmpeg(parts, output_mp3)
         log(f"Wrote {output_mp3}")
-        # #region agent log
         _agent_dbg(
             "TTS-A",
             "synthesize_podcast.py:build:done",
             "podcast written",
             {"output": str(output_mp3), "parts": len(parts)},
         )
-        # #endregion
 
 
 def main() -> None:
@@ -338,7 +353,7 @@ def main() -> None:
     if not script_path.exists():
         raise SystemExit(f"Script file not found: {script_path}")
 
-    asyncio.run(build_podcast(script_path, Path(args.output)))
+    build_podcast(script_path, Path(args.output))
 
 
 if __name__ == "__main__":

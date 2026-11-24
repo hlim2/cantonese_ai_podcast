@@ -51,38 +51,25 @@ Save the generated script as a Markdown file (e.g., `/home/ubuntu/podcast_script
 
 ### Phase 3: Speech Synthesis
 
-Use the `scripts/split_script.py` script to divide the generated podcast script into smaller segments (each under 4000 characters) to comply with TTS tool limits.
+Synthesize the script with ElevenLabs Text-to-Dialogue via `scripts/synthesize_podcast.py`:
 
 ```bash
-SCRIPT_PATH=/home/ubuntu/podcast_script.md OUTPUT_DIR=/home/ubuntu/ MAX_CHARS=4000 python3 /home/ubuntu/skills/podcast-producer/scripts/split_script.py
+export ELEVENLABS_API_KEY=...
+export ELEVENLABS_VOICE_AH_HEI=<voice_id_for_ah_hei>
+export ELEVENLABS_VOICE_AH_MING=<voice_id_for_ah_ming>
+# Optional; default is eleven_v4_turbo
+export ELEVENLABS_MODEL=eleven_v4_turbo
+
+python3 scripts/synthesize_podcast.py \
+  --script podcast_script.md \
+  --output AI_Daily_Podcast_YYYYMMDD.mp3
 ```
 
-Then, for each segment, use the `generate_speech` tool with the following speaker configurations:
+-   **阿希 (Ah Hei)**: `ELEVENLABS_VOICE_AH_HEI` (ElevenLabs voice ID)
+-   **阿明 (Ah Ming)**: `ELEVENLABS_VOICE_AH_MING` (ElevenLabs voice ID)
+-   **Model**: `eleven_v4_turbo` by default (override with `ELEVENLABS_MODEL`)
 
--   **阿希 (Ah Hei)**: `voice_name = Sulafat`
--   **阿明 (Ah Ming)**: `voice_name = Achird`
--   **Language Code**: `zh-HK` (for Hong Kong Cantonese)
-
-Example for a segment:
-
-```python
-print(default_api.generate_speech(
-    brief="Generate speech for podcast segment X.",
-    language_code="zh-HK",
-    path=f"/home/ubuntu/podcast_partX.wav",
-    prompt="You are a Cantonese Podcast producer. Speak in Hong Kong Cantonese.\n阿希: [female][warm and enthusiastic, friendly news anchor tone]\n阿明: [male][curious and easy-going]\n\n" + segment_content,
-    speaker_voice_configs=[
-        {"speaker": "阿希", "voice_name": "Sulafat"},
-        {"speaker": "阿明", "voice_name": "Achird"}
-    ]
-))
-```
-
-After generating all `.wav` segments, concatenate them into a single MP3 file using `ffmpeg`:
-
-```bash
-ffmpeg -i /home/ubuntu/podcast_part1.wav -i /home/ubuntu/podcast_part2.wav ... -filter_complex "[0:a][1:a]...[N:a]concat=n=N:v=0:a=1[outa]" -map "[outa]" /home/ubuntu/AI_Daily_Podcast_YYYYMMDD.mp3
-```
+The script chunks dialogue for the Text-to-Dialogue 2k-character limit and concatenates MP3 parts with `ffmpeg`.
 
 ### Phase 4: Deliver Results
 

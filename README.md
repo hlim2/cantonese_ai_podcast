@@ -38,12 +38,18 @@ Output: podcast_script.md with lines like 阿希: ... / 阿明: ....
 scripts/synthesize_podcast.py:
 
 parses each dialogue line
-speaks them with **edge-tts** (阿希=zh-HK-HiuMaanNeural, 阿明=zh-HK-WanLungNeural)
-merges with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
+batches them into ElevenLabs **Text-to-Dialogue** requests (≤~1800 chars each)
+speaks them with **ElevenLabs** (`eleven_v4_turbo` by default)
+merges chunks with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
 
-Uses Microsoft’s current Edge TTS host (`api.msedgeservices.com`) by default; if that
-handshake returns 403 it falls back to the legacy `speech.platform.bing.com` URL.
-Override with env `EDGE_TTS_WSS_URL` if needed.
+| Setting | Typical value |
+|---------|---------------|
+| ELEVENLABS_API_KEY | ElevenLabs API key (secret) |
+| ELEVENLABS_VOICE_AH_HEI | Voice ID for 阿希 |
+| ELEVENLABS_VOICE_AH_MING | Voice ID for 阿明 |
+| ELEVENLABS_MODEL | `eleven_v4_turbo` (override with `eleven_v4` for long-form quality) |
+
+Optional: `ELEVENLABS_OUTPUT_FORMAT`, `ELEVENLABS_LANGUAGE_CODE`, `ELEVENLABS_BASE_URL`, `ELEVENLABS_MAX_CHUNK_CHARS`.
 
 **4. Deliver to Telegram**
 curl sendDocument uploads:
@@ -55,5 +61,4 @@ using secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
 TELEGRAM_CHAT_ID = Telegram group/channel ID, check ID with @IDBot
 TELEGRAM_BOT_TOKEN = Bot ID, check ID with @BotFather or @IDBot
 
-That’s the full path: **crawled news + 編劇 prompt → SkyClaw script → Cantonese TTS → Telegram files.**
-**
+That’s the full path: **crawled news + 編劇 prompt → LLM script → ElevenLabs TTS → Telegram files.**
