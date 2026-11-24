@@ -130,15 +130,58 @@ def sanitize_tts_text(text: str) -> str:
     return cleaned
 
 
+def _normalize_api_key(raw: str) -> str:
+    """Strip whitespace/quotes that often sneak in when pasting GitHub secrets."""
+    key = (raw or "").strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {"'", '"'}:
+        key = key[1:-1].strip()
+    return key
+
+
+def _looks_like_openrouter_key(api_key: str) -> bool:
+    # OpenRouter user keys: sk-or-v1- + 64 lowercase hex chars (73 total).
+    return bool(re.fullmatch(r"sk-or-v1-[0-9a-f]{64}", api_key))
+
+
 def require_config() -> str:
-    api_key = (
+    api_key = _normalize_api_key(
         os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY") or ""
-    ).strip()
+    )
     if not api_key:
         raise RuntimeError(
             "OPENROUTER_API_KEY is required for OpenRouter TTS "
-            f"(model={OPENROUTER_TTS_MODEL})"
+            f"(model={OPENROUTER_TTS_MODEL}). Add it as a GitHub Actions "
+            "secret (not a Variable), then re-run."
         )
+    _agent_dbg(
+        "TTS-AUTH",
+        "synthesize_podcast.py:require_config",
+        "openrouter key metadata",
+        {
+            "key_len": len(api_key),
+            "starts_sk_or": api_key.startswith("sk-or-"),
+            "looks_like_openrouter": _looks_like_openrouter_key(api_key),
+            "prefix": api_key[:8],
+        },
+    )
+    if not api_key.startswith("sk-or-"):
+        raise RuntimeError(
+            "OPENROUTER_API_KEY does not look like an OpenRouter key "
+            f"(prefix={api_key[:8]!r}, len={len(api_key)}). "
+            "Create a key at https://openrouter.ai/settings/keys "
+            "(must start with sk-or-v1-). Do not paste an ElevenLabs key here."
+        )
+    for name, env_key in (
+        ("阿希", "OPENROUTER_VOICE_AH_HEI"),
+        ("阿明", "OPENROUTER_VOICE_AH_MING"),
+    ):
+        raw = (os.getenv(env_key) or "").strip()
+        if raw and raw.lower() not in OPENROUTER_VOICES:
+            log(
+                f"Ignoring invalid {env_key}={raw!r}; using "
+                f"{SPEAKER_VOICES[name]!r}. OpenRouter voices are names like "
+                "sarah/george, not ElevenLabs dashboard IDs."
+            )
     return api_key
 
 
@@ -206,6 +249,27 @@ def _error_detail(response: requests.Response) -> str:
     return str(payload)[:500]
 
 
+def _format_openrouter_http_error(response: requests.Response) -> str:
+    detail = _error_detail(response)
+    base = f"OpenRouter TTS HTTP {response.status_code}: {detail}"
+    lowered = detail.lower()
+    if response.status_code == 401 or "user not found" in lowered:
+        return (
+            f"{base}\n"
+            "Fix: OPENROUTER_API_KEY is missing, deleted, disabled, truncated, "
+            "or not an OpenRouter user key. Create a new key at "
+            "https://openrouter.ai/settings/keys (starts with sk-or-v1-), "
+            "update the GitHub Actions secret (no quotes/spaces), then re-run. "
+            "Management keys cannot call TTS."
+        )
+    if response.status_code == 402 or "insufficient" in lowered:
+        return (
+            f"{base}\n"
+            "Fix: add credits at https://openrouter.ai/settings/credits"
+        )
+    return base
+
+
 def synthesize_chunk(
     api_key: str,
     *,
@@ -255,21 +319,17 @@ def synthesize_chunk(
                     or response.headers.get("x-generation-id")
                 )
 
-            detail = _error_detail(response)
+            detail = _format_openrouter_http_error(response)
             if response.status_code in {408, 429, 500, 502, 503, 504}:
-                last_error = RuntimeError(
-                    f"OpenRouter TTS HTTP {response.status_code}: {detail}"
-                )
+                last_error = RuntimeError(detail)
                 log(
                     f"TTS chunk retry {attempt}/{max_attempts} "
-                    f"HTTP {response.status_code}: {detail}"
+                    f"HTTP {response.status_code}: {_error_detail(response)}"
                 )
                 time.sleep(1.5 * attempt)
                 continue
 
-            raise RuntimeError(
-                f"OpenRouter TTS HTTP {response.status_code}: {detail}"
-            )
+            raise RuntimeError(detail)
         except requests.RequestException as exc:
             last_error = exc
             log(f"TTS chunk network error attempt {attempt}/{max_attempts}: {exc}")

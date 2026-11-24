@@ -52,6 +52,11 @@ merges chunks with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
 Use OpenRouter voice **names** (`sarah`, `george`, `alice`, …), not ElevenLabs
 dashboard voice IDs. Optional: `OPENROUTER_BASE_URL`, `OPENROUTER_TTS_FORMAT`.
 
+`OPENROUTER_API_KEY` must be a **user** key from
+https://openrouter.ai/settings/keys starting with `sk-or-v1-` (GitHub **Secret**,
+no quotes). A `401 User not found` means the key is wrong/deleted/disabled —
+create a new key and update the secret. Management keys cannot call TTS.
+
 **4. Deliver to Telegram**
 curl sendDocument uploads:
 
