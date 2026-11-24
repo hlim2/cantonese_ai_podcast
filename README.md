@@ -49,6 +49,10 @@ merges chunks with **ffmpeg** into AI_Daily_Podcast_YYYYMMDD.mp3
 | ELEVENLABS_VOICE_AH_MING | Voice ID for 阿明 |
 | ELEVENLABS_MODEL | `eleven_v4_turbo` (override with `eleven_v4` for long-form quality) |
 
+Voice IDs must be allowed on your ElevenLabs plan. A `free_users_not_allowed` /
+“Creator tier or above” error means pick free Voice Library IDs, or upgrade the
+account. Do not use the display name — use the opaque voice ID string.
+
 Optional: `ELEVENLABS_OUTPUT_FORMAT`, `ELEVENLABS_LANGUAGE_CODE`, `ELEVENLABS_BASE_URL`, `ELEVENLABS_MAX_CHUNK_CHARS`.
 
 **4. Deliver to Telegram**

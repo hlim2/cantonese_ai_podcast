@@ -144,15 +144,51 @@ def chunk_dialogue(
     return chunks
 
 
-def _error_detail(response: requests.Response) -> str:
+def _parse_error_payload(response: requests.Response) -> dict[str, Any] | str:
     try:
         payload = response.json()
     except ValueError:
         return (response.text or "")[:500]
     if isinstance(payload, dict):
+        return payload
+    return str(payload)[:500]
+
+
+def _error_detail(response: requests.Response) -> str:
+    payload = _parse_error_payload(response)
+    if isinstance(payload, dict):
         detail = payload.get("detail") or payload.get("message") or payload
         return str(detail)[:500]
-    return str(payload)[:500]
+    return payload
+
+
+def _format_elevenlabs_http_error(response: requests.Response) -> str:
+    """Build an actionable error for common ElevenLabs account/voice failures."""
+    payload = _parse_error_payload(response)
+    detail = _error_detail(response)
+    base = f"ElevenLabs HTTP {response.status_code}: {detail}"
+    if not isinstance(payload, dict):
+        return base
+
+    status = str(payload.get("status") or payload.get("code") or "").lower()
+    message = str(payload.get("message") or "").lower()
+    if status in {"free_users_not_allowed", "voice_not_allowed"} or (
+        "creator tier" in message or "free users" in message
+    ):
+        return (
+            f"{base}\n"
+            "Fix: this voice requires ElevenLabs Creator (or higher). Either "
+            "upgrade the account, or set ELEVENLABS_VOICE_AH_HEI / "
+            "ELEVENLABS_VOICE_AH_MING to free Voice Library IDs that your plan "
+            "can use."
+        )
+    if status in {"invalid_api_key", "unauthorized"} or response.status_code == 401:
+        return (
+            f"{base}\n"
+            "Fix: update GitHub secret ELEVENLABS_API_KEY with a valid key "
+            "(no quotes/spaces)."
+        )
+    return base
 
 
 def synthesize_chunk(
@@ -199,22 +235,18 @@ def synthesize_chunk(
                 )
                 return request_id
 
-            detail = _error_detail(response)
+            detail = _format_elevenlabs_http_error(response)
             # Retry transient / rate-limit responses.
             if response.status_code in {408, 429, 500, 502, 503, 504}:
-                last_error = RuntimeError(
-                    f"ElevenLabs HTTP {response.status_code}: {detail}"
-                )
+                last_error = RuntimeError(detail)
                 log(
                     f"TTS chunk retry {attempt}/{max_attempts} "
-                    f"HTTP {response.status_code}: {detail}"
+                    f"HTTP {response.status_code}: {_error_detail(response)}"
                 )
                 time.sleep(1.5 * attempt)
                 continue
 
-            raise RuntimeError(
-                f"ElevenLabs HTTP {response.status_code}: {detail}"
-            )
+            raise RuntimeError(detail)
         except requests.RequestException as exc:
             last_error = exc
             log(f"TTS chunk network error attempt {attempt}/{max_attempts}: {exc}")
